@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -f "$PROJECT_ROOT/project.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$PROJECT_ROOT/project.env"
+fi
+
+APP_NAME="${ADPUTATE_DISPLAY_NAME:-Adputate}"
+CLI_NAME="${ADPUTATE_CLI_NAME:-adputate}"
+if [[ -n "${CONTAINER_BIN:-}" ]]; then
+  CONTAINER_BIN="$CONTAINER_BIN"
+elif [[ -x /opt/homebrew/bin/container ]]; then
+  CONTAINER_BIN="/opt/homebrew/bin/container"
+else
+  CONTAINER_BIN="container"
+fi
+CONTAINER_NAME="${ADPUTATE_CONTAINER_NAME:-${CLI_NAME}-pihole}"
+SERVICE_LABEL="${ADPUTATE_SERVICE_LABEL:-com.${CLI_NAME}.pihole}"
+IMAGE="${ADPUTATE_IMAGE:-pihole/pihole:2026.07.2}"
+APP_DIR="${ADPUTATE_APP_DIR:-$HOME/Library/Application Support/$APP_NAME}"
+DATA_DIR="$APP_DIR/data"
+CONFIG_DIR="$APP_DIR/config"
+ENV_FILE="$CONFIG_DIR/pihole.env"
+LOG_DIR="$APP_DIR/logs"
+TELEPORTER_DIR="$APP_DIR/teleporter"
+ETC_PIHOLE_VOLUME="${ADPUTATE_ETC_PIHOLE_VOLUME:-${CLI_NAME}-etc-pihole}"
+ETC_DNSMASQ_VOLUME="${ADPUTATE_ETC_DNSMASQ_VOLUME:-${CLI_NAME}-etc-dnsmasq.d}"
+HOST_WEB_PORT="${ADPUTATE_WEB_PORT:-8080}"
+HOST_DNS_PORT="${ADPUTATE_DNS_PORT:-5053}"
+HOST_BIND_ADDRESS="${ADPUTATE_BIND_ADDRESS:-127.0.0.1}"
+
+usage() {
+  cat <<'EOF'
+Usage: __CLI_NAME__ <command>
+
+Commands:
+  doctor       Validate host, runtime, configuration, and port prerequisites.
+  health       Check the running container, Pi-hole API, HTTP, and DNS.
+  smoke        Check container registry reachability with a tiny image.
+  init         Create local config and data directories.
+  start        Start Pi-hole in Apple's container runtime.
+  stop         Stop the Pi-hole container.
+  restart      Restart the Pi-hole container.
+  status       Show container status and local endpoints.
+  logs         Show Pi-hole logs.
+  admin        Open the Pi-hole admin UI in the default browser.
+  admin-url    Print the Pi-hole admin UI URL.
+  dns-url      Print the local DNS endpoint.
+  open-admin   Alias for admin.
+  blocking-status
+              Show Pi-hole blocking state.
+  enable       Enable Pi-hole blocking.
+  disable [time]
+              Disable Pi-hole blocking, optionally for a duration like 5m.
+  password     Print the configured web password, if managed here.
+  shell        Open a shell inside the running container.
+  launchd-plist
+              Render a launchd plist for the current command/name.
+  service-install
+              Install and start the user LaunchAgent.
+  service-uninstall
+              Stop and remove the user LaunchAgent.
+  service-enable
+              Enable startup at user login.
+  service-disable
+              Disable startup at user login without removing the plist.
+  service-kick
+              Ask launchd to run the startup job now.
+  service-status
+              Show user LaunchAgent state.
+  teleporter-export [directory]
+              Export a Pi-hole Teleporter ZIP.
+  teleporter-import <zip>
+              Import a Pi-hole Teleporter ZIP.
+  reset        Delete the container but keep persistent Pi-hole data.
+  uninstall    Delete the container and local persistent data. Requires --yes.
+
+Default endpoints (override with ADPUTATE_BIND_ADDRESS, ADPUTATE_WEB_PORT,
+and ADPUTATE_DNS_PORT):
+  Admin UI: http://127.0.0.1:8080/admin/
+  DNS:      127.0.0.1#5053
+EOF
+}
+
+render_usage() {
+  usage | sed "s/__CLI_NAME__/$CLI_NAME/g"
+}
+
+die() {
+  printf '%s: %s\n' "$CLI_NAME" "$*" >&2
+  exit 1
+}
+
+have_container() {
+  command -v "$CONTAINER_BIN" >/dev/null 2>&1
+}
+
+require_container() {
+  have_container || die "Apple container CLI not found. Install or expose it as CONTAINER_BIN."
+}
+
+require_apple_silicon() {
+  [[ "$(uname -m)" == "arm64" ]] || die "Apple Silicon arm64 host required."
+}
+
+container_exists() {
+  "$CONTAINER_BIN" list --all --quiet 2>/dev/null | grep -Fxq "$CONTAINER_NAME"
+}
+
+container_running() {
+  "$CONTAINER_BIN" list --quiet 2>/dev/null | grep -Fxq "$CONTAINER_NAME"
+}
+
+container_service_reachable() {
+  "$CONTAINER_BIN" list --all --quiet >/dev/null 2>&1
+}
+
+volume_exists() {
+  "$CONTAINER_BIN" volume inspect "$1" >/dev/null 2>&1
+}
+
+ensure_volumes() {
+  require_container
+  volume_exists "$ETC_PIHOLE_VOLUME" || "$CONTAINER_BIN" volume create "$ETC_PIHOLE_VOLUME" >/dev/null
+  volume_exists "$ETC_DNSMASQ_VOLUME" || "$CONTAINER_BIN" volume create "$ETC_DNSMASQ_VOLUME" >/dev/null
+}
+
+ensure_dirs() {
+  umask 077
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$TELEPORTER_DIR"
+}
+
+generate_password() {
+  /usr/bin/openssl rand -base64 24 | tr -d '\n'
+}
+
+detect_timezone() {
+  local zone
+  zone="$(/bin/ls -l /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')"
+  if [[ -n "$zone" && "$zone" != *" "* && "$zone" != /etc/localtime* ]]; then
+    printf '%s' "$zone"
+  else
+    printf 'America/New_York'
+  fi
+}
+
+init_config() {
+  ensure_dirs
+  if [[ ! -f "$ENV_FILE" ]]; then
+    local password
+    password="$(generate_password)"
+    cat >"$ENV_FILE" <<EOF
+TZ=$(detect_timezone)
+FTLCONF_webserver_api_password=$password
+FTLCONF_dns_listeningMode=ALL
+FTLCONF_dns_upstreams=1.1.1.1;9.9.9.9
+EOF
+    chmod 600 "$ENV_FILE"
+  elif grep -q '^TZ=$' "$ENV_FILE"; then
+    sed -i '' "s#^TZ=.*#TZ=$(detect_timezone)#" "$ENV_FILE"
+  fi
+}
+
+CHECK_PASS_COUNT=0
+CHECK_WARN_COUNT=0
+CHECK_FAIL_COUNT=0
+
+reset_checks() {
+  CHECK_PASS_COUNT=0
+  CHECK_WARN_COUNT=0
+  CHECK_FAIL_COUNT=0
+}
+
+check_pass() {
+  CHECK_PASS_COUNT=$((CHECK_PASS_COUNT + 1))
+  printf '[PASS] %s\n' "$*"
+}
+
+check_warn() {
+  CHECK_WARN_COUNT=$((CHECK_WARN_COUNT + 1))
+  printf '[WARN] %s\n' "$*"
+}
+
+check_fail() {
+  CHECK_FAIL_COUNT=$((CHECK_FAIL_COUNT + 1))
+  printf '[FAIL] %s\n' "$*"
+}
+
+check_summary() {
+  printf '\nSummary: %s passed, %s warnings, %s failed\n' \
+    "$CHECK_PASS_COUNT" "$CHECK_WARN_COUNT" "$CHECK_FAIL_COUNT"
+  (( CHECK_FAIL_COUNT == 0 ))
+}
+
+port_listener_summary() {
+  local protocol="$1"
+  local port="$2"
+  if [[ "$protocol" == "TCP" ]]; then
+    /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {print $1 " (pid " $2 ")"; exit}'
+  else
+    /usr/sbin/lsof -nP -iUDP:"$port" 2>/dev/null | awk 'NR > 1 {print $1 " (pid " $2 ")"; exit}'
+  fi
+}
+
+check_port_available() {
+  local label="$1"
+  local protocol="$2"
+  local port="$3"
+  local listener
+  listener="$(port_listener_summary "$protocol" "$port" || true)"
+  if [[ -n "$listener" ]]; then
+    check_fail "$label port $port/$protocol is already used by $listener"
+  else
+    check_pass "$label port $port/$protocol is available"
+  fi
+}
+
+doctor() {
+  reset_checks
+
+  local arch macos_version macos_major container_version container_major state_parent plist_path installed_bin
+  arch="$(uname -m)"
+  if [[ "$arch" == "arm64" ]]; then
+    check_pass "Host architecture is arm64"
+  else
+    check_fail "Host architecture is $arch; Apple Silicon arm64 is required"
+  fi
+
+  macos_version="$(sw_vers -productVersion 2>/dev/null || true)"
+  macos_major="${macos_version%%.*}"
+  if [[ "$macos_major" =~ ^[0-9]+$ ]] && (( macos_major >= 26 )); then
+    check_pass "macOS $macos_version is supported"
+  else
+    check_fail "macOS ${macos_version:-unknown} is unsupported; macOS 26 or newer is required"
+  fi
+
+  if command -v "$CONTAINER_BIN" >/dev/null 2>&1; then
+    container_version="$("$CONTAINER_BIN" --version 2>/dev/null || true)"
+    container_major="$(printf '%s\n' "$container_version" | sed -nE 's/.*version ([0-9]+).*/\1/p')"
+    if [[ "$container_major" =~ ^[0-9]+$ ]] && (( container_major >= 1 )); then
+      check_pass "$container_version"
+    else
+      check_warn "Apple container version could not be confirmed as 1.x: ${container_version:-unknown}"
+    fi
+    if container_service_reachable; then
+      check_pass "Apple container service is reachable"
+    else
+      check_fail "Apple container service is not reachable"
+    fi
+  else
+    check_fail "Apple container CLI not found at $CONTAINER_BIN"
+  fi
+
+  local required_command
+  for required_command in /usr/bin/curl /usr/bin/dig /usr/bin/openssl /usr/bin/plutil /bin/launchctl /usr/sbin/lsof /sbin/ifconfig; do
+    if [[ -x "$required_command" ]]; then
+      check_pass "Required command exists: $required_command"
+    else
+      check_fail "Required command is missing: $required_command"
+    fi
+  done
+
+  if [[ -f "$PROJECT_ROOT/project.env" ]]; then
+    check_pass "Project configuration found"
+  else
+    check_warn "Project configuration is missing; built-in defaults will be used"
+  fi
+
+  if [[ "$HOST_WEB_PORT" =~ ^[0-9]+$ ]] && (( HOST_WEB_PORT >= 1 && HOST_WEB_PORT <= 65535 )); then
+    check_pass "Web port $HOST_WEB_PORT is valid"
+  else
+    check_fail "Web port is invalid: $HOST_WEB_PORT"
+  fi
+  if [[ "$HOST_DNS_PORT" =~ ^[0-9]+$ ]] && (( HOST_DNS_PORT >= 1 && HOST_DNS_PORT <= 65535 )); then
+    check_pass "DNS port $HOST_DNS_PORT is valid"
+    if (( HOST_DNS_PORT < 1024 && EUID != 0 )); then
+      check_fail "Apple container requires root privileges to publish DNS on host port $HOST_DNS_PORT"
+    fi
+  else
+    check_fail "DNS port is invalid: $HOST_DNS_PORT"
+  fi
+
+  if [[ "$HOST_BIND_ADDRESS" == "127.0.0.1" ]]; then
+    check_pass "Bind address is local-only: $HOST_BIND_ADDRESS"
+    if [[ "$HOST_DNS_PORT" == "53" ]]; then
+      check_warn "Direct loopback publishing on port 53 collided with Apple container DNS on this host during testing"
+    fi
+  elif [[ "$HOST_BIND_ADDRESS" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && /sbin/ifconfig | grep -Fq "inet $HOST_BIND_ADDRESS "; then
+    check_pass "Bind address belongs to this Mac: $HOST_BIND_ADDRESS"
+  else
+    check_fail "Bind address is not an active IPv4 address on this Mac: $HOST_BIND_ADDRESS"
+  fi
+
+  if [[ "$IMAGE" == *":latest" || "$IMAGE" != *":"* ]]; then
+    check_warn "Pi-hole image is not pinned to a release: $IMAGE"
+  else
+    check_pass "Pi-hole image is pinned: $IMAGE"
+  fi
+
+  state_parent="$(dirname -- "$APP_DIR")"
+  if [[ -d "$APP_DIR" && -w "$APP_DIR" ]]; then
+    check_pass "Application data directory is writable"
+  elif [[ ! -e "$APP_DIR" && -d "$state_parent" && -w "$state_parent" ]]; then
+    check_pass "Application data directory can be created"
+  else
+    check_fail "Application data path is not writable: $APP_DIR"
+  fi
+
+  if container_running; then
+    check_pass "$CONTAINER_NAME is running; host port availability checks are skipped"
+  else
+    check_port_available "Admin HTTP" TCP "$HOST_WEB_PORT"
+    check_port_available "DNS" TCP "$HOST_DNS_PORT"
+    check_port_available "DNS" UDP "$HOST_DNS_PORT"
+  fi
+
+  plist_path="$(launchd_plist_path)"
+  if [[ -f "$plist_path" ]]; then
+    installed_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist_path" 2>/dev/null || true)"
+    if [[ "$installed_bin" == "$PROJECT_ROOT/bin/$CLI_NAME" ]]; then
+      check_pass "LaunchAgent points to the current checkout"
+    else
+      check_warn "LaunchAgent points to ${installed_bin:-an unreadable path}; run: $CLI_NAME service-install"
+    fi
+  else
+    check_warn "LaunchAgent is not installed"
+  fi
+
+  check_summary
+}
+
+health() {
+  reset_checks
+  require_container
+
+  if ! container_service_reachable; then
+    check_fail "Apple container service is not reachable; run: container system start"
+    check_summary
+    return
+  fi
+  if ! container_exists; then
+    check_fail "$CONTAINER_NAME does not exist; run: $CLI_NAME start"
+    check_summary
+    return
+  fi
+  if ! container_running; then
+    check_fail "$CONTAINER_NAME exists but is stopped; run: $CLI_NAME start"
+    check_summary
+    return
+  fi
+  check_pass "$CONTAINER_NAME is running"
+
+  if "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole api dns/blocking >/dev/null 2>&1; then
+    check_pass "Pi-hole FTL API responds inside the container"
+  else
+    check_fail "Pi-hole FTL API did not respond inside the container"
+  fi
+
+  if /usr/bin/curl --noproxy '*' --silent --show-error --fail --max-time 5 "http://$HOST_BIND_ADDRESS:$HOST_WEB_PORT/admin/" >/dev/null 2>&1; then
+    check_pass "Admin HTTP endpoint responds at $HOST_BIND_ADDRESS:$HOST_WEB_PORT"
+  else
+    check_fail "Admin HTTP endpoint did not respond at $HOST_BIND_ADDRESS:$HOST_WEB_PORT"
+  fi
+
+  if /usr/bin/dig +time=2 +tries=1 +short @"$HOST_BIND_ADDRESS" -p "$HOST_DNS_PORT" pi.hole A 2>/dev/null | grep -q .; then
+    check_pass "DNS responds over UDP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
+  else
+    check_fail "DNS did not respond over UDP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
+  fi
+
+  if /usr/bin/dig +tcp +time=2 +tries=1 +short @"$HOST_BIND_ADDRESS" -p "$HOST_DNS_PORT" pi.hole A 2>/dev/null | grep -q .; then
+    check_pass "DNS responds over TCP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
+  else
+    check_fail "DNS did not respond over TCP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
+  fi
+
+  check_summary
+}
+
+smoke() {
+  require_apple_silicon
+  require_container
+  start_container_system
+  printf 'Checking Docker registry DNS...\n'
+  if ! /usr/bin/curl -sSI --connect-timeout 10 https://registry-1.docker.io/v2/ >/dev/null; then
+    die "Cannot reach registry-1.docker.io. Container image pulls will fail until host DNS/network access is fixed."
+  fi
+  printf 'Running tiny ARM container...\n'
+  "$CONTAINER_BIN" run --rm --platform linux/arm64 alpine:3.22 uname -m
+}
+
+start_container_system() {
+  "$CONTAINER_BIN" system start >/dev/null 2>&1 || true
+}
+
+start_pihole() {
+  require_apple_silicon
+  require_container
+  init_config
+  ensure_volumes
+  start_container_system
+
+  if container_running; then
+    printf '%s is already running.\n' "$CONTAINER_NAME"
+    return
+  fi
+
+  if container_exists; then
+    "$CONTAINER_BIN" start "$CONTAINER_NAME"
+    return
+  fi
+
+  "$CONTAINER_BIN" run \
+    --detach \
+    --name "$CONTAINER_NAME" \
+    --platform linux/arm64 \
+    --cpus 1 \
+    --memory "${ADPUTATE_MEMORY:-256M}" \
+    --env-file "$ENV_FILE" \
+    --publish "$HOST_BIND_ADDRESS:$HOST_WEB_PORT:80/tcp" \
+    --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/tcp" \
+    --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/udp" \
+    --volume "$ETC_PIHOLE_VOLUME:/etc/pihole" \
+    --volume "$ETC_DNSMASQ_VOLUME:/etc/dnsmasq.d" \
+    "$IMAGE"
+}
+
+stop_pihole() {
+  require_container
+  if container_exists; then
+    "$CONTAINER_BIN" stop "$CONTAINER_NAME"
+  else
+    printf '%s does not exist.\n' "$CONTAINER_NAME"
+  fi
+}
+
+reset_container() {
+  require_container
+  if container_exists; then
+    "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    "$CONTAINER_BIN" delete "$CONTAINER_NAME"
+  else
+    printf '%s does not exist.\n' "$CONTAINER_NAME"
+  fi
+}
+
+status() {
+  require_container
+  if container_running; then
+    printf '%s is running.\n' "$CONTAINER_NAME"
+  elif container_exists; then
+    printf '%s exists but is stopped.\n' "$CONTAINER_NAME"
+  else
+    printf '%s has not been created.\n' "$CONTAINER_NAME"
+  fi
+  printf 'Admin UI: http://%s:%s/admin/\n' "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT"
+  printf 'DNS:      %s#%s\n' "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT"
+  printf 'Volumes:  %s, %s\n' "$ETC_PIHOLE_VOLUME" "$ETC_DNSMASQ_VOLUME"
+}
+
+admin_url() {
+  printf 'http://%s:%s/admin/\n' "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT"
+}
+
+dns_url() {
+  printf '%s#%s\n' "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT"
+}
+
+logs() {
+  require_container
+  "$CONTAINER_BIN" logs "$CONTAINER_NAME"
+}
+
+open_admin() {
+  open "$(admin_url)"
+}
+
+blocking_status() {
+  require_container
+  container_running || die "$CONTAINER_NAME is not running. Run: $CLI_NAME start"
+  "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole api dns/blocking
+}
+
+enable_blocking() {
+  require_container
+  container_running || die "$CONTAINER_NAME is not running. Run: $CLI_NAME start"
+  "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole enable
+}
+
+disable_blocking() {
+  require_container
+  container_running || die "$CONTAINER_NAME is not running. Run: $CLI_NAME start"
+  local duration="${1:-}"
+  if [[ -n "$duration" ]]; then
+    "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole disable "$duration"
+  else
+    "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole disable
+  fi
+}
+
+password() {
+  [[ -f "$ENV_FILE" ]] || die "No managed env file exists yet. Run: $CLI_NAME init"
+  awk -F= '$1 == "FTLCONF_webserver_api_password" {print $2}' "$ENV_FILE"
+}
+
+shell_into_container() {
+  require_container
+  "$CONTAINER_BIN" exec --interactive --tty "$CONTAINER_NAME" /bin/bash
+}
+
+teleporter_export() {
+  require_container
+  container_running || die "$CONTAINER_NAME is not running. Run: $CLI_NAME start"
+  ensure_dirs
+  local dest_dir output archive dest_path
+  dest_dir="${1:-$TELEPORTER_DIR}"
+  mkdir -p "$dest_dir"
+  output="$("$CONTAINER_BIN" exec "$CONTAINER_NAME" sh -c 'cd /tmp && pihole-FTL --teleporter')"
+  printf '%s\n' "$output"
+  archive="$(printf '%s\n' "$output" | awk '/\.zip$/ {print $NF}' | tail -1)"
+  [[ -n "$archive" ]] || die "Could not determine Teleporter archive name."
+  dest_path="$dest_dir/$archive"
+  "$CONTAINER_BIN" exec "$CONTAINER_NAME" cat "/tmp/$archive" >"$dest_path"
+  "$CONTAINER_BIN" exec "$CONTAINER_NAME" rm -f "/tmp/$archive" >/dev/null 2>&1 || true
+  printf 'Saved Teleporter archive: %s\n' "$dest_path"
+}
+
+teleporter_import() {
+  require_container
+  container_running || die "$CONTAINER_NAME is not running. Run: $CLI_NAME start"
+  local archive
+  archive="${1:-}"
+  [[ -n "$archive" ]] || die "Usage: $CLI_NAME teleporter-import <zip>"
+  [[ -f "$archive" ]] || die "Teleporter archive not found: $archive"
+  "$CONTAINER_BIN" exec --interactive "$CONTAINER_NAME" sh -c 'cat > /tmp/adputate-import.zip && pihole-FTL --teleporter /tmp/adputate-import.zip && rm -f /tmp/adputate-import.zip' <"$archive"
+}
+
+launchd_plist() {
+  local template="$PROJECT_ROOT/packaging/launchd/com.adputate.pihole.plist.template"
+  [[ -f "$template" ]] || die "Launchd template not found: $template"
+  sed \
+    -e "s#__ADPUTATE_SERVICE_LABEL__#$SERVICE_LABEL#g" \
+    -e "s#__ADPUTATE_BIN__#$PROJECT_ROOT/bin/$CLI_NAME#g" \
+    -e "s#__ADPUTATE_LOG_DIR__#$LOG_DIR#g" \
+    "$template"
+}
+
+launchd_domain() {
+  printf 'gui/%s' "$(id -u)"
+}
+
+launchd_plist_path() {
+  printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$SERVICE_LABEL"
+}
+
+service_install() {
+  ensure_dirs
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  launchd_plist >"$plist_path"
+  plutil -lint "$plist_path" >/dev/null
+
+  launchctl bootout "$(launchd_domain)" "$plist_path" >/dev/null 2>&1 || true
+  launchctl bootstrap "$(launchd_domain)" "$plist_path"
+  launchctl enable "$(launchd_domain)/$SERVICE_LABEL" >/dev/null 2>&1 || true
+  launchctl kickstart -k "$(launchd_domain)/$SERVICE_LABEL" >/dev/null 2>&1 || true
+  printf 'Installed %s at %s\n' "$SERVICE_LABEL" "$plist_path"
+}
+
+service_uninstall() {
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  launchctl bootout "$(launchd_domain)" "$plist_path" >/dev/null 2>&1 || true
+  rm -f "$plist_path"
+  printf 'Removed %s\n' "$SERVICE_LABEL"
+}
+
+service_enable() {
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  [[ -f "$plist_path" ]] || service_install
+  launchctl enable "$(launchd_domain)/$SERVICE_LABEL"
+  printf 'Enabled %s at user login\n' "$SERVICE_LABEL"
+}
+
+service_disable() {
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  [[ -f "$plist_path" ]] || die "LaunchAgent is not installed. Run: $CLI_NAME service-install"
+  launchctl disable "$(launchd_domain)/$SERVICE_LABEL"
+  printf 'Disabled %s at user login\n' "$SERVICE_LABEL"
+}
+
+service_kick() {
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  [[ -f "$plist_path" ]] || service_install
+  launchctl kickstart -k "$(launchd_domain)/$SERVICE_LABEL"
+  printf 'Kicked %s\n' "$SERVICE_LABEL"
+}
+
+service_status() {
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  local domain_service
+  domain_service="$(launchd_domain)/$SERVICE_LABEL"
+
+  if [[ -f "$plist_path" ]]; then
+    printf 'LaunchAgent: installed at %s\n' "$plist_path"
+  else
+    printf 'LaunchAgent: not installed\n'
+  fi
+
+  local print_output state last_exit runs enabled_status
+  print_output="$(launchctl print "$domain_service" 2>/dev/null || true)"
+  if [[ -z "$print_output" ]]; then
+    printf 'launchctl: not loaded\n'
+    return
+  fi
+
+  state="$(printf '%s\n' "$print_output" | awk -F'= ' '/state =/ {print $2; exit}')"
+  last_exit="$(printf '%s\n' "$print_output" | awk -F'= ' '/last exit code =/ {print $2; exit}')"
+  runs="$(printf '%s\n' "$print_output" | awk -F'= ' '/runs =/ {print $2; exit}')"
+
+  if launchctl print-disabled "$(launchd_domain)" 2>/dev/null | grep -q "\"$SERVICE_LABEL\" => true"; then
+    enabled_status="disabled"
+  else
+    enabled_status="enabled"
+  fi
+
+  printf 'launchctl: loaded\n'
+  printf 'startup:   %s\n' "$enabled_status"
+  printf 'state:     %s\n' "${state:-unknown}"
+  printf 'runs:      %s\n' "${runs:-unknown}"
+  printf 'last exit: %s\n' "${last_exit:-unknown}"
+}
+
+uninstall() {
+  [[ "${1:-}" == "--yes" ]] || die "Refusing to remove data without --yes."
+  service_uninstall >/dev/null 2>&1 || true
+  reset_container
+  "$CONTAINER_BIN" volume delete "$ETC_PIHOLE_VOLUME" >/dev/null 2>&1 || true
+  "$CONTAINER_BIN" volume delete "$ETC_DNSMASQ_VOLUME" >/dev/null 2>&1 || true
+  rm -rf "$APP_DIR"
+}
+
+main() {
+  case "${1:-}" in
+    doctor) doctor ;;
+    health) health ;;
+    init) init_config ;;
+    smoke) smoke ;;
+    start) start_pihole ;;
+    stop) stop_pihole ;;
+    restart) stop_pihole; start_pihole ;;
+    status) status ;;
+    logs) logs ;;
+    admin) open_admin ;;
+    admin-url) admin_url ;;
+    dns-url) dns_url ;;
+    open-admin) open_admin ;;
+    blocking-status) blocking_status ;;
+    enable) enable_blocking ;;
+    disable) shift; disable_blocking "${1:-}" ;;
+    password) password ;;
+    shell) shell_into_container ;;
+    launchd-plist) launchd_plist ;;
+    service-install) service_install ;;
+    service-uninstall) service_uninstall ;;
+    service-enable) service_enable ;;
+    service-disable) service_disable ;;
+    service-kick) service_kick ;;
+    service-status) service_status ;;
+    teleporter-export) shift; teleporter_export "${1:-}" ;;
+    teleporter-import) shift; teleporter_import "${1:-}" ;;
+    reset) reset_container ;;
+    uninstall) shift; uninstall "${1:-}" ;;
+    -h|--help|help|"") render_usage ;;
+    *) render_usage; exit 64 ;;
+  esac
+}
+
+main "$@"
