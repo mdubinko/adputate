@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+action="${1:-}"
+bind_address="${2:-}"
+backend_port="${3:-}"
+interface="${4:-}"
+service_label="${5:-com.adputate.dns-forwarder}"
+support_dir="/Library/Application Support/Adputate"
+legacy_pf_file="$support_dir/router-forward.pf"
+legacy_loader="$support_dir/load-router-forwarder"
+proxy="$support_dir/adputate-dns-proxy"
+source_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+proxy_source="$source_dir/adputate-dns-proxy.c"
+plist="/Library/LaunchDaemons/$service_label.plist"
+log_file="/var/log/adputate-dns-forwarder.log"
+
+valid_ipv4() {
+  local address="$1" octet rest index
+  [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  rest="$address"
+  for index in 1 2 3 4; do
+    octet="${rest%%.*}"
+    (( 10#$octet <= 255 )) || return 1
+    if [[ "$rest" == *.* ]]; then
+      rest="${rest#*.}"
+    fi
+  done
+}
+
+validate_install_args() {
+  valid_ipv4 "$bind_address" || { printf 'Invalid bind address: %s\n' "$bind_address" >&2; exit 1; }
+  [[ "$bind_address" != "127.0.0.1" ]] || { printf 'The router frontend requires a LAN address.\n' >&2; exit 1; }
+  [[ "$backend_port" =~ ^[0-9]+$ ]] && (( 10#$backend_port >= 1024 && 10#$backend_port <= 65535 )) || {
+    printf 'Backend port must be between 1024 and 65535.\n' >&2; exit 1;
+  }
+  [[ "$interface" =~ ^[a-zA-Z0-9]+$ ]] || { printf 'Invalid interface: %s\n' "$interface" >&2; exit 1; }
+  /sbin/ifconfig "$interface" | /usr/bin/grep -Fq "inet $bind_address " || {
+    printf '%s is not assigned to %s.\n' "$bind_address" "$interface" >&2; exit 1;
+  }
+  [[ "$service_label" =~ ^[a-zA-Z0-9.-]+$ ]] || { printf 'Invalid service label.\n' >&2; exit 1; }
+}
+
+install_forwarder() {
+  [[ "$EUID" -eq 0 ]] || { printf 'Run this helper as root.\n' >&2; exit 1; }
+  validate_install_args
+  [[ -f "$proxy_source" ]] || { printf 'Missing proxy source: %s\n' "$proxy_source" >&2; exit 1; }
+
+  /bin/mkdir -p "$support_dir"
+  /usr/bin/xcrun clang -O2 -Wall -Wextra -Werror -pthread "$proxy_source" -o "$proxy"
+  /usr/sbin/chown root:wheel "$proxy"
+  /bin/chmod 755 "$proxy"
+
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$service_label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$proxy</string>
+    <string>$bind_address</string>
+    <string>$bind_address</string>
+    <string>$backend_port</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+    <string>$log_file</string>
+  <key>StandardErrorPath</key>
+    <string>$log_file</string>
+</dict>
+</plist>
+EOF
+  /usr/sbin/chown root:wheel "$plist"
+  /bin/chmod 644 "$plist"
+  /usr/bin/plutil -lint "$plist" >/dev/null
+
+  /bin/launchctl bootout system "$plist" >/dev/null 2>&1 || true
+  /bin/rm -f "$legacy_loader" "$legacy_pf_file"
+  /bin/launchctl bootstrap system "$plist"
+  /bin/launchctl kickstart -k "system/$service_label"
+  printf 'Installed native DNS frontend: %s:53 -> %s:%s via %s\n' \
+    "$bind_address" "$bind_address" "$backend_port" "$interface"
+}
+
+uninstall_forwarder() {
+  [[ "$EUID" -eq 0 ]] || { printf 'Run this helper as root.\n' >&2; exit 1; }
+  /bin/launchctl bootout system "$plist" >/dev/null 2>&1 || true
+  /bin/rm -f "$plist" "$proxy" "$legacy_loader" "$legacy_pf_file" "$log_file"
+  /bin/rmdir "$support_dir" >/dev/null 2>&1 || true
+  printf 'Removed %s.\n' "$service_label"
+}
+
+case "$action" in
+  install) install_forwarder ;;
+  uninstall) uninstall_forwarder ;;
+  *) printf 'Usage: %s install <LAN-IP> <backend-port> <interface> [label] | uninstall\n' "$0" >&2; exit 64 ;;
+esac

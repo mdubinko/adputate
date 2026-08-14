@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          bash -n bin/adputate
+          bash -n packaging/router/adputate-router
+          bash -n tests/test_cli.sh
+      - name: Compile native DNS frontend
+        run: xcrun clang -O2 -Wall -Wextra -Werror -pthread packaging/router/adputate-dns-proxy.c -o "$RUNNER_TEMP/adputate-dns-proxy"
+      - name: Run CLI tests
+        run: tests/test_cli.sh

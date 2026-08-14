@@ -18,20 +18,32 @@ elif [[ -x /opt/homebrew/bin/container ]]; then
 else
   CONTAINER_BIN="container"
 fi
-CONTAINER_NAME="${ADPUTATE_CONTAINER_NAME:-${CLI_NAME}-pihole}"
-SERVICE_LABEL="${ADPUTATE_SERVICE_LABEL:-com.${CLI_NAME}.pihole}"
-IMAGE="${ADPUTATE_IMAGE:-pihole/pihole:2026.07.2}"
 APP_DIR="${ADPUTATE_APP_DIR:-$HOME/Library/Application Support/$APP_NAME}"
 DATA_DIR="$APP_DIR/data"
 CONFIG_DIR="$APP_DIR/config"
+RUNTIME_CONFIG_FILE="$CONFIG_DIR/runtime.env"
+
+if [[ -f "$RUNTIME_CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$RUNTIME_CONFIG_FILE"
+fi
+
+CONTAINER_NAME="${ADPUTATE_CONTAINER_NAME:-${CLI_NAME}-pihole}"
+SERVICE_LABEL="${ADPUTATE_SERVICE_LABEL:-com.${CLI_NAME}.pihole}"
+IMAGE="${ADPUTATE_IMAGE:-${ADPUTATE_CONFIG_IMAGE:-pihole/pihole:2026.07.2}}"
+MEMORY="${ADPUTATE_MEMORY:-${ADPUTATE_CONFIG_MEMORY:-256M}}"
 ENV_FILE="$CONFIG_DIR/pihole.env"
 LOG_DIR="$APP_DIR/logs"
 TELEPORTER_DIR="$APP_DIR/teleporter"
+DNS_BACKUP_FILE="$CONFIG_DIR/dns-backup.env"
 ETC_PIHOLE_VOLUME="${ADPUTATE_ETC_PIHOLE_VOLUME:-${CLI_NAME}-etc-pihole}"
 ETC_DNSMASQ_VOLUME="${ADPUTATE_ETC_DNSMASQ_VOLUME:-${CLI_NAME}-etc-dnsmasq.d}"
-HOST_WEB_PORT="${ADPUTATE_WEB_PORT:-8080}"
-HOST_DNS_PORT="${ADPUTATE_DNS_PORT:-5053}"
-HOST_BIND_ADDRESS="${ADPUTATE_BIND_ADDRESS:-127.0.0.1}"
+HOST_WEB_PORT="${ADPUTATE_WEB_PORT:-${ADPUTATE_CONFIG_WEB_PORT:-8080}}"
+HOST_DNS_PORT="${ADPUTATE_DNS_PORT:-${ADPUTATE_CONFIG_DNS_PORT:-5053}}"
+HOST_BIND_ADDRESS="${ADPUTATE_BIND_ADDRESS:-${ADPUTATE_CONFIG_BIND_ADDRESS:-127.0.0.1}}"
+ROUTER_INTERFACE="${ADPUTATE_ROUTER_INTERFACE:-${ADPUTATE_CONFIG_ROUTER_INTERFACE:-}}"
+ROUTER_SERVICE_LABEL="com.${CLI_NAME}.dns-forwarder"
+ROUTER_PLIST_PATH="/Library/LaunchDaemons/$ROUTER_SERVICE_LABEL.plist"
 
 usage() {
   cat <<'EOF'
@@ -42,7 +54,12 @@ Commands:
   health       Check the running container, Pi-hole API, HTTP, and DNS.
   smoke        Check container registry reachability with a tiny image.
   init         Create local config and data directories.
+  configure [options]
+              Persist bind address, ports, image, memory, and LAN interface.
+  config       Show effective runtime configuration.
   start        Start Pi-hole in Apple's container runtime.
+  reconcile --yes
+              Recreate a drifted container while preserving named volumes.
   stop         Stop the Pi-hole container.
   restart      Restart the Pi-hole container.
   status       Show container status and local endpoints.
@@ -76,6 +93,17 @@ Commands:
               Export a Pi-hole Teleporter ZIP.
   teleporter-import <zip>
               Import a Pi-hole Teleporter ZIP.
+  router-install
+              Install the native TCP/UDP port-53 frontend.
+  router-status
+              Check the router-facing port-53 path.
+  router-uninstall
+              Remove the native port-53 frontend.
+  dns-enable <network-service>
+              Back up and point a macOS network service at Adputate.
+  dns-disable  Restore the saved macOS DNS configuration.
+  upgrade <image> --yes
+              Back up, recreate on a pinned image, and roll back on failure.
   reset        Delete the container but keep persistent Pi-hole data.
   uninstall    Delete the container and local persistent data. Requires --yes.
 
@@ -119,6 +147,70 @@ container_service_reachable() {
   "$CONTAINER_BIN" list --all --quiet >/dev/null 2>&1
 }
 
+container_inspect_file() {
+  local destination="$1"
+  "$CONTAINER_BIN" inspect "$CONTAINER_NAME" >"$destination"
+}
+
+inspect_value() {
+  local file="$1" key_path="$2"
+  /usr/bin/plutil -extract "$key_path" raw -o - "$file" 2>/dev/null || true
+}
+
+container_drift_report() {
+  container_exists || return 0
+  local inspection actual expected drift=0
+  inspection="$(mktemp "${TMPDIR:-/tmp}/adputate-inspect.XXXXXX")"
+  if ! container_inspect_file "$inspection"; then
+    rm -f "$inspection"
+    printf 'Could not inspect %s.\n' "$CONTAINER_NAME"
+    return 1
+  fi
+
+  while IFS='|' read -r key_path expected; do
+    actual="$(inspect_value "$inspection" "$key_path")"
+    if [[ "$actual" != "$expected" ]]; then
+      printf '  %s: expected %s, found %s\n' "${key_path##*.}" "$expected" "${actual:-unset}"
+      drift=1
+    fi
+  done <<EOF
+0.configuration.labels.adputate_config_version|1
+0.configuration.labels.adputate_bind_address|$HOST_BIND_ADDRESS
+0.configuration.labels.adputate_web_port|$HOST_WEB_PORT
+0.configuration.labels.adputate_dns_port|$HOST_DNS_PORT
+0.configuration.labels.adputate_image|$IMAGE
+0.configuration.labels.adputate_memory|$MEMORY
+EOF
+
+  rm -f "$inspection"
+  (( drift == 0 ))
+}
+
+container_matches_config() {
+  container_drift_report >/dev/null
+}
+
+require_container_matches_config() {
+  if ! container_matches_config; then
+    printf '%s configuration drift detected:\n' "$CONTAINER_NAME" >&2
+    container_drift_report >&2 || true
+    die "Run: $CLI_NAME reconcile --yes"
+  fi
+}
+
+container_current_image() {
+  local inspection image
+  inspection="$(mktemp "${TMPDIR:-/tmp}/adputate-inspect.XXXXXX")"
+  container_inspect_file "$inspection" || { rm -f "$inspection"; return 1; }
+  image="$(inspect_value "$inspection" '0.configuration.labels.adputate_image')"
+  if [[ -z "$image" ]]; then
+    image="$(inspect_value "$inspection" '0.configuration.image.reference')"
+    image="${image#docker.io/}"
+  fi
+  rm -f "$inspection"
+  printf '%s\n' "$image"
+}
+
 volume_exists() {
   "$CONTAINER_BIN" volume inspect "$1" >/dev/null 2>&1
 }
@@ -132,6 +224,121 @@ ensure_volumes() {
 ensure_dirs() {
   umask 077
   mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$TELEPORTER_DIR"
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+valid_ipv4() {
+  local address="$1" octet rest index
+  [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  rest="$address"
+  for index in 1 2 3 4; do
+    octet="${rest%%.*}"
+    (( 10#$octet <= 255 )) || return 1
+    if [[ "$rest" == *.* ]]; then
+      rest="${rest#*.}"
+    fi
+  done
+}
+
+valid_memory() {
+  [[ "$1" =~ ^[1-9][0-9]*[KMG]$ ]]
+}
+
+image_is_pinned() {
+  [[ "$1" == *":"* && "$1" != *":latest" ]]
+}
+
+detect_default_interface() {
+  /sbin/route -n get default 2>/dev/null | awk '$1 == "interface:" {print $2; exit}'
+}
+
+write_runtime_config() {
+  local bind_address="$1" web_port="$2" dns_port="$3" image="$4" memory="$5" router_interface="$6"
+  local temporary
+  ensure_dirs
+  temporary="$(mktemp "$CONFIG_DIR/runtime.env.XXXXXX")"
+  chmod 600 "$temporary"
+  {
+    printf '# Generated by %s configure.\n' "$CLI_NAME"
+    printf 'ADPUTATE_CONFIG_BIND_ADDRESS=%q\n' "$bind_address"
+    printf 'ADPUTATE_CONFIG_WEB_PORT=%q\n' "$web_port"
+    printf 'ADPUTATE_CONFIG_DNS_PORT=%q\n' "$dns_port"
+    printf 'ADPUTATE_CONFIG_IMAGE=%q\n' "$image"
+    printf 'ADPUTATE_CONFIG_MEMORY=%q\n' "$memory"
+    printf 'ADPUTATE_CONFIG_ROUTER_INTERFACE=%q\n' "$router_interface"
+  } >"$temporary"
+  mv "$temporary" "$RUNTIME_CONFIG_FILE"
+}
+
+ensure_runtime_config() {
+  [[ -f "$RUNTIME_CONFIG_FILE" ]] || write_runtime_config \
+    "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE"
+}
+
+show_config() {
+  printf 'Runtime config: %s\n' "$RUNTIME_CONFIG_FILE"
+  printf 'Bind address:  %s\n' "$HOST_BIND_ADDRESS"
+  printf 'Web port:      %s\n' "$HOST_WEB_PORT"
+  printf 'DNS backend:   %s\n' "$HOST_DNS_PORT"
+  printf 'Image:         %s\n' "$IMAGE"
+  printf 'Memory:        %s\n' "$MEMORY"
+  printf 'LAN interface: %s\n' "${ROUTER_INTERFACE:-not configured}"
+  if [[ -f "$ROUTER_PLIST_PATH" ]]; then
+    printf 'Port 53:       installed\n'
+  else
+    printf 'Port 53:       not installed\n'
+  fi
+}
+
+configure_runtime() {
+  local bind_address="$HOST_BIND_ADDRESS" web_port="$HOST_WEB_PORT" dns_port="$HOST_DNS_PORT"
+  local image="$IMAGE" memory="$MEMORY" router_interface="$ROUTER_INTERFACE"
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --bind-address) (( $# >= 2 )) || die "--bind-address requires a value"; bind_address="$2"; shift 2 ;;
+      --web-port) (( $# >= 2 )) || die "--web-port requires a value"; web_port="$2"; shift 2 ;;
+      --dns-port) (( $# >= 2 )) || die "--dns-port requires a value"; dns_port="$2"; shift 2 ;;
+      --image) (( $# >= 2 )) || die "--image requires a value"; image="$2"; shift 2 ;;
+      --memory) (( $# >= 2 )) || die "--memory requires a value"; memory="$2"; shift 2 ;;
+      --router-interface) (( $# >= 2 )) || die "--router-interface requires a value"; router_interface="$2"; shift 2 ;;
+      --show) show_config; return ;;
+      *) die "Unknown configure option: $1" ;;
+    esac
+  done
+
+  valid_ipv4 "$bind_address" || die "Invalid IPv4 bind address: $bind_address"
+  valid_port "$web_port" || die "Invalid web port: $web_port"
+  valid_port "$dns_port" || die "Invalid DNS port: $dns_port"
+  (( 10#$dns_port >= 1024 )) || die "The Pi-hole backend must use an unprivileged port (1024 or higher)"
+  image_is_pinned "$image" || die "Image must use a pinned tag, not latest: $image"
+  valid_memory "$memory" || die "Memory must look like 256M or 1G: $memory"
+
+  if [[ "$bind_address" != "127.0.0.1" ]]; then
+    [[ -n "$router_interface" ]] || router_interface="$(detect_default_interface)"
+    [[ -n "$router_interface" ]] || die "Could not detect the default LAN interface; pass --router-interface"
+    /sbin/ifconfig "$router_interface" 2>/dev/null | grep -Fq "inet $bind_address " || \
+      die "$bind_address is not assigned to interface $router_interface"
+  fi
+
+  write_runtime_config "$bind_address" "$web_port" "$dns_port" "$image" "$memory" "$router_interface"
+  printf 'Saved runtime configuration.\n'
+  ADPUTATE_CONFIG_BIND_ADDRESS="$bind_address"
+  ADPUTATE_CONFIG_WEB_PORT="$web_port"
+  ADPUTATE_CONFIG_DNS_PORT="$dns_port"
+  ADPUTATE_CONFIG_IMAGE="$image"
+  ADPUTATE_CONFIG_MEMORY="$memory"
+  ADPUTATE_CONFIG_ROUTER_INTERFACE="$router_interface"
+  HOST_BIND_ADDRESS="$bind_address"
+  HOST_WEB_PORT="$web_port"
+  HOST_DNS_PORT="$dns_port"
+  IMAGE="$image"
+  MEMORY="$memory"
+  ROUTER_INTERFACE="$router_interface"
+  show_config
 }
 
 generate_password() {
@@ -150,6 +357,7 @@ detect_timezone() {
 
 init_config() {
   ensure_dirs
+  ensure_runtime_config
   if [[ ! -f "$ENV_FILE" ]]; then
     local password
     password="$(generate_password)"
@@ -256,18 +464,29 @@ doctor() {
   fi
 
   local required_command
-  for required_command in /usr/bin/curl /usr/bin/dig /usr/bin/openssl /usr/bin/plutil /bin/launchctl /usr/sbin/lsof /sbin/ifconfig; do
+  for required_command in /usr/bin/curl /usr/bin/dig /usr/bin/openssl /usr/bin/plutil /usr/bin/sudo /bin/launchctl /usr/sbin/lsof /usr/sbin/networksetup /sbin/ifconfig /sbin/route; do
     if [[ -x "$required_command" ]]; then
       check_pass "Required command exists: $required_command"
     else
       check_fail "Required command is missing: $required_command"
     fi
   done
+  if /usr/bin/xcrun --find clang >/dev/null 2>&1; then
+    check_pass "Xcode Command Line Tools provide clang"
+  else
+    check_fail "clang is unavailable; install Xcode Command Line Tools for router-install"
+  fi
 
   if [[ -f "$PROJECT_ROOT/project.env" ]]; then
     check_pass "Project configuration found"
   else
     check_warn "Project configuration is missing; built-in defaults will be used"
+  fi
+
+  if [[ -f "$RUNTIME_CONFIG_FILE" ]]; then
+    check_pass "Persistent runtime configuration found"
+  else
+    check_warn "Persistent runtime configuration is not initialized; run: $CLI_NAME configure"
   fi
 
   if [[ "$HOST_WEB_PORT" =~ ^[0-9]+$ ]] && (( HOST_WEB_PORT >= 1 && HOST_WEB_PORT <= 65535 )); then
@@ -312,10 +531,34 @@ doctor() {
 
   if container_running; then
     check_pass "$CONTAINER_NAME is running; host port availability checks are skipped"
+    if container_matches_config; then
+      check_pass "$CONTAINER_NAME matches persistent runtime configuration"
+    else
+      check_fail "$CONTAINER_NAME configuration has drifted; run: $CLI_NAME reconcile --yes"
+    fi
   else
     check_port_available "Admin HTTP" TCP "$HOST_WEB_PORT"
     check_port_available "DNS" TCP "$HOST_DNS_PORT"
     check_port_available "DNS" UDP "$HOST_DNS_PORT"
+  fi
+
+  if [[ -f "$ROUTER_PLIST_PATH" ]]; then
+    check_pass "Router-facing port-53 LaunchDaemon is installed"
+    local router_bind router_backend router_port
+    router_bind="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$ROUTER_PLIST_PATH" 2>/dev/null || true)"
+    router_backend="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$ROUTER_PLIST_PATH" 2>/dev/null || true)"
+    router_port="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$ROUTER_PLIST_PATH" 2>/dev/null || true)"
+    if [[ "$router_bind" == "$HOST_BIND_ADDRESS" && "$router_backend" == "$HOST_BIND_ADDRESS" && "$router_port" == "$HOST_DNS_PORT" ]]; then
+      check_pass "Router frontend matches persistent runtime configuration"
+    else
+      check_fail "Router frontend configuration has drifted; run: $CLI_NAME router-install"
+    fi
+  elif [[ "$HOST_BIND_ADDRESS" != "127.0.0.1" ]]; then
+    check_warn "Router-facing port-53 frontend is not installed"
+  fi
+
+  if [[ -f "$DNS_BACKUP_FILE" ]]; then
+    check_warn "A macOS DNS backup is active; restore with: $CLI_NAME dns-disable"
   fi
 
   plist_path="$(launchd_plist_path)"
@@ -366,19 +609,142 @@ health() {
     check_fail "Admin HTTP endpoint did not respond at $HOST_BIND_ADDRESS:$HOST_WEB_PORT"
   fi
 
-  if /usr/bin/dig +time=2 +tries=1 +short @"$HOST_BIND_ADDRESS" -p "$HOST_DNS_PORT" pi.hole A 2>/dev/null | grep -q .; then
+  if dns_query_works udp "$HOST_DNS_PORT"; then
     check_pass "DNS responds over UDP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
   else
     check_fail "DNS did not respond over UDP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
   fi
 
-  if /usr/bin/dig +tcp +time=2 +tries=1 +short @"$HOST_BIND_ADDRESS" -p "$HOST_DNS_PORT" pi.hole A 2>/dev/null | grep -q .; then
+  if dns_query_works tcp "$HOST_DNS_PORT"; then
     check_pass "DNS responds over TCP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
   else
     check_fail "DNS did not respond over TCP at $HOST_BIND_ADDRESS:$HOST_DNS_PORT"
   fi
 
+  if [[ -f "$ROUTER_PLIST_PATH" ]]; then
+    if dns_query_works udp 53; then
+      check_pass "Router-facing DNS responds over UDP at $HOST_BIND_ADDRESS:53"
+    else
+      check_fail "Router-facing DNS did not respond over UDP at $HOST_BIND_ADDRESS:53"
+    fi
+    if dns_query_works tcp 53; then
+      check_pass "Router-facing DNS responds over TCP at $HOST_BIND_ADDRESS:53"
+    else
+      check_fail "Router-facing DNS did not respond over TCP at $HOST_BIND_ADDRESS:53"
+    fi
+  else
+    check_warn "Router-facing port-53 frontend is not installed"
+  fi
+
   check_summary
+}
+
+router_helper() {
+  printf '%s/packaging/router/adputate-router' "$PROJECT_ROOT"
+}
+
+router_install() {
+  local helper
+  helper="$(router_helper)"
+  [[ -x "$helper" ]] || die "Router helper not found or not executable: $helper"
+  [[ "$HOST_BIND_ADDRESS" != "127.0.0.1" ]] || die "Configure an active LAN bind address first"
+  valid_port "$HOST_DNS_PORT" && (( 10#$HOST_DNS_PORT >= 1024 )) || \
+    die "Configure an unprivileged DNS backend port first"
+  [[ -n "$ROUTER_INTERFACE" ]] || die "Configure a LAN interface first"
+  backend_ready || die "Pi-hole backend is not healthy; run: $CLI_NAME health"
+  printf 'Installing a root LaunchDaemon for the native port-53 frontend.\n'
+  /usr/bin/sudo "$helper" install "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
+  router_status
+}
+
+router_status() {
+  reset_checks
+  if [[ -f "$ROUTER_PLIST_PATH" ]]; then
+    check_pass "Router LaunchDaemon is installed"
+  else
+    check_fail "Router LaunchDaemon is not installed"
+  fi
+  if /bin/launchctl print "system/$ROUTER_SERVICE_LABEL" >/dev/null 2>&1; then
+    check_pass "Router LaunchDaemon is loaded"
+  else
+    check_fail "Router LaunchDaemon is not loaded"
+  fi
+  if dns_query_works udp 53; then
+    check_pass "Router-facing DNS responds over UDP at $HOST_BIND_ADDRESS:53"
+  else
+    check_fail "Router-facing DNS did not respond over UDP at $HOST_BIND_ADDRESS:53"
+  fi
+  if dns_query_works tcp 53; then
+    check_pass "Router-facing DNS responds over TCP at $HOST_BIND_ADDRESS:53"
+  else
+    check_fail "Router-facing DNS did not respond over TCP at $HOST_BIND_ADDRESS:53"
+  fi
+  check_summary
+}
+
+router_uninstall() {
+  local helper
+  helper="$(router_helper)"
+  [[ -x "$helper" ]] || die "Router helper not found or not executable: $helper"
+  /usr/bin/sudo "$helper" uninstall "" "" "" "$ROUTER_SERVICE_LABEL"
+}
+
+restore_dns_backup() {
+  [[ -f "$DNS_BACKUP_FILE" ]] || die "No saved DNS configuration exists"
+  # shellcheck disable=SC1090
+  source "$DNS_BACKUP_FILE"
+  [[ -n "${DNS_SERVICE:-}" ]] || die "Saved DNS configuration is invalid"
+  declare -p DNS_PREVIOUS >/dev/null 2>&1 || die "Saved DNS configuration is invalid"
+  if (( ${#DNS_PREVIOUS[@]} == 0 )); then
+    /usr/bin/sudo /usr/sbin/networksetup -setdnsservers "$DNS_SERVICE" empty
+  else
+    /usr/bin/sudo /usr/sbin/networksetup -setdnsservers "$DNS_SERVICE" "${DNS_PREVIOUS[@]}"
+  fi
+}
+
+dns_enable() {
+  local network_service="${1:-}" current line temporary
+  local -a previous_dns=()
+  [[ -n "$network_service" ]] || die "Usage: $CLI_NAME dns-enable <network-service>"
+  [[ ! -f "$DNS_BACKUP_FILE" ]] || die "A DNS backup is already active; run: $CLI_NAME dns-disable"
+  [[ -f "$ROUTER_PLIST_PATH" ]] || die "Router-facing port 53 is not installed"
+  router_status >/dev/null || die "Router-facing DNS is unhealthy"
+
+  current="$(/usr/sbin/networksetup -getdnsservers "$network_service" 2>&1)" || die "$current"
+  if [[ "$current" != "There aren't any DNS Servers set on $network_service." ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && previous_dns[${#previous_dns[@]}]="$line"
+    done <<<"$current"
+  fi
+
+  ensure_dirs
+  temporary="$(mktemp "$CONFIG_DIR/dns-backup.env.XXXXXX")"
+  chmod 600 "$temporary"
+  {
+    printf 'DNS_SERVICE=%q\n' "$network_service"
+    printf 'DNS_PREVIOUS=('
+    for line in "${previous_dns[@]}"; do
+      printf '%q ' "$line"
+    done
+    printf ')\n'
+  } >"$temporary"
+  mv "$temporary" "$DNS_BACKUP_FILE"
+
+  if ! /usr/bin/sudo /usr/sbin/networksetup -setdnsservers "$network_service" "$HOST_BIND_ADDRESS"; then
+    restore_dns_backup || true
+    die "Could not set DNS; the previous configuration was restored"
+  fi
+  if ! /usr/sbin/networksetup -getdnsservers "$network_service" | grep -Fxq "$HOST_BIND_ADDRESS"; then
+    restore_dns_backup || true
+    die "DNS verification failed; the previous configuration was restored"
+  fi
+  printf 'Enabled Adputate DNS for %s. Restore with: %s dns-disable\n' "$network_service" "$CLI_NAME"
+}
+
+dns_disable() {
+  restore_dns_backup
+  rm -f "$DNS_BACKUP_FILE"
+  printf 'Restored the previous DNS configuration.\n'
 }
 
 smoke() {
@@ -394,7 +760,67 @@ smoke() {
 }
 
 start_container_system() {
-  "$CONTAINER_BIN" system start >/dev/null 2>&1 || true
+  container_service_reachable && return
+  "$CONTAINER_BIN" system start >/dev/null
+  container_service_reachable || die "Apple container service did not become reachable"
+}
+
+create_pihole() {
+  "$CONTAINER_BIN" run \
+    --detach \
+    --name "$CONTAINER_NAME" \
+    --platform linux/arm64 \
+    --cpus 1 \
+    --memory "$MEMORY" \
+    --label adputate_config_version=1 \
+    --label "adputate_bind_address=$HOST_BIND_ADDRESS" \
+    --label "adputate_web_port=$HOST_WEB_PORT" \
+    --label "adputate_dns_port=$HOST_DNS_PORT" \
+    --label "adputate_image=$IMAGE" \
+    --label "adputate_memory=$MEMORY" \
+    --env-file "$ENV_FILE" \
+    --publish "$HOST_BIND_ADDRESS:$HOST_WEB_PORT:80/tcp" \
+    --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/tcp" \
+    --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/udp" \
+    --volume "$ETC_PIHOLE_VOLUME:/etc/pihole" \
+    --volume "$ETC_DNSMASQ_VOLUME:/etc/dnsmasq.d" \
+    "$IMAGE"
+}
+
+dns_query_works() {
+  local protocol="$1" port="$2" output
+  local -a protocol_args=()
+  [[ "$protocol" == "udp" ]] || protocol_args=(+tcp)
+  if ! output="$(/usr/bin/dig "${protocol_args[@]}" +time=2 +tries=1 +short \
+      @"$HOST_BIND_ADDRESS" -p "$port" pi.hole A 2>/dev/null)"; then
+    return 1
+  fi
+  grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<<"$output"
+}
+
+backend_ready() {
+  container_running && \
+    "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole api dns/blocking >/dev/null 2>&1 && \
+    /usr/bin/curl --noproxy '*' --silent --fail --max-time 3 "http://$HOST_BIND_ADDRESS:$HOST_WEB_PORT/admin/" >/dev/null 2>&1 && \
+    dns_query_works udp "$HOST_DNS_PORT" && \
+    dns_query_works tcp "$HOST_DNS_PORT"
+}
+
+wait_for_ready() {
+  local timeout="${ADPUTATE_READY_TIMEOUT:-30}" elapsed=0
+  printf 'Waiting for Pi-hole readiness'
+  while (( elapsed < timeout )); do
+    if backend_ready; then
+      printf ' ready.\n'
+      return
+    fi
+    printf '.'
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  printf ' failed.\n' >&2
+  "$CONTAINER_BIN" logs "$CONTAINER_NAME" 2>/dev/null | tail -50 >&2 || true
+  return 1
 }
 
 start_pihole() {
@@ -405,28 +831,37 @@ start_pihole() {
   start_container_system
 
   if container_running; then
+    require_container_matches_config
     printf '%s is already running.\n' "$CONTAINER_NAME"
+    wait_for_ready || die "Pi-hole did not become ready"
     return
   fi
 
   if container_exists; then
+    require_container_matches_config
     "$CONTAINER_BIN" start "$CONTAINER_NAME"
+    wait_for_ready || die "Pi-hole did not become ready"
     return
   fi
 
-  "$CONTAINER_BIN" run \
-    --detach \
-    --name "$CONTAINER_NAME" \
-    --platform linux/arm64 \
-    --cpus 1 \
-    --memory "${ADPUTATE_MEMORY:-256M}" \
-    --env-file "$ENV_FILE" \
-    --publish "$HOST_BIND_ADDRESS:$HOST_WEB_PORT:80/tcp" \
-    --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/tcp" \
-    --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/udp" \
-    --volume "$ETC_PIHOLE_VOLUME:/etc/pihole" \
-    --volume "$ETC_DNSMASQ_VOLUME:/etc/dnsmasq.d" \
-    "$IMAGE"
+  create_pihole
+  wait_for_ready || die "Pi-hole did not become ready"
+}
+
+reconcile_container() {
+  [[ "${1:-}" == "--yes" ]] || die "Refusing to recreate the container without --yes"
+  require_apple_silicon
+  require_container
+  init_config
+  ensure_volumes
+  start_container_system
+  if container_exists; then
+    "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    "$CONTAINER_BIN" delete "$CONTAINER_NAME"
+  fi
+  create_pihole
+  wait_for_ready || die "Pi-hole did not become ready after reconciliation"
+  printf 'Reconciled %s without deleting named volumes.\n' "$CONTAINER_NAME"
 }
 
 stop_pihole() {
@@ -436,6 +871,13 @@ stop_pihole() {
   else
     printf '%s does not exist.\n' "$CONTAINER_NAME"
   fi
+}
+
+restart_pihole() {
+  require_container
+  container_exists && require_container_matches_config
+  stop_pihole
+  start_pihole
 }
 
 reset_container() {
@@ -457,8 +899,21 @@ status() {
   else
     printf '%s has not been created.\n' "$CONTAINER_NAME"
   fi
+  if container_exists; then
+    if container_matches_config; then
+      printf 'Config:    matches desired state\n'
+    else
+      printf 'Config:    drift detected; run: %s reconcile --yes\n' "$CLI_NAME"
+      container_drift_report || true
+    fi
+  fi
   printf 'Admin UI: http://%s:%s/admin/\n' "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT"
   printf 'DNS:      %s#%s\n' "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT"
+  if [[ -f "$ROUTER_PLIST_PATH" ]]; then
+    printf 'Router:   %s#53\n' "$HOST_BIND_ADDRESS"
+  else
+    printf 'Router:   not installed\n'
+  fi
   printf 'Volumes:  %s, %s\n' "$ETC_PIHOLE_VOLUME" "$ETC_DNSMASQ_VOLUME"
 }
 
@@ -537,6 +992,44 @@ teleporter_import() {
   [[ -n "$archive" ]] || die "Usage: $CLI_NAME teleporter-import <zip>"
   [[ -f "$archive" ]] || die "Teleporter archive not found: $archive"
   "$CONTAINER_BIN" exec --interactive "$CONTAINER_NAME" sh -c 'cat > /tmp/adputate-import.zip && pihole-FTL --teleporter /tmp/adputate-import.zip && rm -f /tmp/adputate-import.zip' <"$archive"
+}
+
+upgrade_pihole() {
+  local target_image="${1:-}" confirmation="${2:-}" old_image backup_dir
+  [[ -n "$target_image" ]] || die "Usage: $CLI_NAME upgrade <pinned-image> --yes"
+  [[ "$confirmation" == "--yes" ]] || die "Refusing to upgrade without --yes"
+  image_is_pinned "$target_image" || die "Upgrade image must use a pinned tag, not latest"
+  require_container
+  container_running || die "$CONTAINER_NAME must be running for a backup-first upgrade"
+  backend_ready || die "Pi-hole must be healthy before upgrade"
+  old_image="$(container_current_image)"
+  [[ -n "$old_image" ]] || die "Could not determine the current image"
+  [[ "$old_image" != "$target_image" ]] || die "$CONTAINER_NAME already uses $target_image"
+
+  backup_dir="$TELEPORTER_DIR/pre-upgrade-$(date +%Y%m%d-%H%M%S)"
+  printf 'Creating pre-upgrade Teleporter backup...\n'
+  teleporter_export "$backup_dir"
+  printf 'Pulling %s...\n' "$target_image"
+  "$CONTAINER_BIN" image pull "$target_image"
+
+  "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  "$CONTAINER_BIN" delete "$CONTAINER_NAME"
+  IMAGE="$target_image"
+  write_runtime_config "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE"
+
+  if create_pihole && wait_for_ready; then
+    printf 'Upgrade succeeded: %s -> %s\n' "$old_image" "$target_image"
+    return
+  fi
+
+  printf 'Upgrade failed; rolling back to %s...\n' "$old_image" >&2
+  "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  "$CONTAINER_BIN" delete "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  IMAGE="$old_image"
+  write_runtime_config "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE"
+  create_pihole
+  wait_for_ready || die "Upgrade and rollback both failed; backup is in $backup_dir"
+  die "Upgrade failed and the previous image was restored; backup is in $backup_dir"
 }
 
 launchd_plist() {
@@ -642,6 +1135,8 @@ service_status() {
 
 uninstall() {
   [[ "${1:-}" == "--yes" ]] || die "Refusing to remove data without --yes."
+  [[ ! -f "$DNS_BACKUP_FILE" ]] || die "Restore macOS DNS first: $CLI_NAME dns-disable"
+  [[ ! -f "$ROUTER_PLIST_PATH" ]] || die "Remove the router frontend first: $CLI_NAME router-uninstall"
   service_uninstall >/dev/null 2>&1 || true
   reset_container
   "$CONTAINER_BIN" volume delete "$ETC_PIHOLE_VOLUME" >/dev/null 2>&1 || true
@@ -654,10 +1149,13 @@ main() {
     doctor) doctor ;;
     health) health ;;
     init) init_config ;;
+    configure) shift; configure_runtime "$@" ;;
+    config) show_config ;;
     smoke) smoke ;;
     start) start_pihole ;;
     stop) stop_pihole ;;
-    restart) stop_pihole; start_pihole ;;
+    restart) restart_pihole ;;
+    reconcile) shift; reconcile_container "${1:-}" ;;
     status) status ;;
     logs) logs ;;
     admin) open_admin ;;
@@ -678,6 +1176,12 @@ main() {
     service-status) service_status ;;
     teleporter-export) shift; teleporter_export "${1:-}" ;;
     teleporter-import) shift; teleporter_import "${1:-}" ;;
+    router-install) router_install ;;
+    router-status) router_status ;;
+    router-uninstall) router_uninstall ;;
+    dns-enable) shift; dns_enable "${1:-}" ;;
+    dns-disable) dns_disable ;;
+    upgrade) shift; upgrade_pihole "${1:-}" "${2:-}" ;;
     reset) reset_container ;;
     uninstall) shift; uninstall "${1:-}" ;;
     -h|--help|help|"") render_usage ;;

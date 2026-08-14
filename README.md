@@ -5,7 +5,7 @@ Pi-hole for Apple Silicon Macs, using Apple's native container runtime.
 Adputate is an experimental macOS wrapper around the official Pi-hole container image. Its first milestone is a dependable standalone DNS server with explicit health checks, persistent data, backups, and safe lifecycle management. Primary/replica synchronization can come later.
 
 > [!WARNING]
-> Adputate is not ready to become a router's only DNS server. Pi-hole works over a LAN-bound unprivileged port, but router-compatible TCP/UDP port 53 still needs a supervised privileged forwarding layer. Keep a working secondary resolver while testing.
+> Adputate is pre-release infrastructure. Keep a working secondary resolver while testing, reserve the Mac's LAN address, and verify port 53 from another machine before changing router DHCP settings.
 
 ## Status
 
@@ -18,6 +18,11 @@ The current shell CLI can:
 - Enable or disable blocking and report blocking status.
 - Export and import Pi-hole Teleporter archives.
 - Install and manage a per-user LaunchAgent.
+- Persist desired runtime configuration and detect/reconcile container drift.
+- Wait for API, HTTP, UDP DNS, and TCP DNS readiness after lifecycle changes.
+- Install a supervised, least-privilege TCP/UDP port-53 frontend.
+- Back up, change, verify, and restore macOS DNS settings.
+- Perform backup-first image upgrades with automatic rollback.
 - Bind published services to loopback or an active LAN IPv4 address.
 
 The implementation has been tested with:
@@ -32,6 +37,7 @@ The implementation has been tested with:
 - macOS 26 or newer
 - Apple's [`container`](https://github.com/apple/container) CLI, version 1.x
 - `/usr/bin/curl`, `/usr/bin/dig`, and the standard macOS command-line tools checked by `doctor`
+- Xcode Command Line Tools (`xcrun clang`) to build the small native port-53 frontend during installation
 
 Install Apple Container from its signed release package, start its system service, and confirm that `container --version` works before using Adputate.
 
@@ -59,11 +65,11 @@ dig @127.0.0.1 -p 5053 example.com A
 dig +tcp @127.0.0.1 -p 5053 example.com A
 ```
 
-Runtime state is stored under `~/Library/Application Support/Adputate`. Pi-hole configuration is stored in Apple container named volumes rather than inside the repository.
+Runtime state is stored under `~/Library/Application Support/Adputate`. Pi-hole configuration is stored in Apple container named volumes rather than inside the repository. For LAN/router use, continue with [Router Deployment](docs/router-deployment.md).
 
 ## Configuration
 
-The CLI reads project identity from `project.env`. Runtime settings can be overridden in the environment:
+The CLI reads project identity from `project.env` and persists runtime settings in `~/Library/Application Support/Adputate/config/runtime.env`. Environment variables take precedence over persisted values, which take precedence over defaults.
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -72,26 +78,36 @@ The CLI reads project identity from `project.env`. Runtime settings can be overr
 | `ADPUTATE_DNS_PORT` | `5053` | Host DNS port for TCP and UDP |
 | `ADPUTATE_IMAGE` | `pihole/pihole:2026.07.2` | Pi-hole image tag |
 | `ADPUTATE_MEMORY` | `256M` | Container memory limit |
+| `ADPUTATE_ROUTER_INTERFACE` | detected | LAN interface used by the port-53 frontend |
 | `ADPUTATE_APP_DIR` | `~/Library/Application Support/Adputate` | Runtime configuration, logs, and backups |
 | `CONTAINER_BIN` | auto-detected | Apple Container executable |
 
-For an experimental LAN-bound instance on an unprivileged port:
+Persist a LAN configuration before creating the container:
 
 ```bash
-ADPUTATE_BIND_ADDRESS=<mac-lan-ip> \
-ADPUTATE_WEB_PORT=18080 \
-ADPUTATE_DNS_PORT=5053 \
+bin/adputate configure --bind-address <mac-lan-ip> --web-port 18080 \
+  --dns-port 5053 --router-interface <interface>
+bin/adputate config
 bin/adputate doctor
-
-ADPUTATE_BIND_ADDRESS=<mac-lan-ip> \
-ADPUTATE_WEB_PORT=18080 \
-ADPUTATE_DNS_PORT=5053 \
 bin/adputate start
 ```
 
-Use the same overrides with `health`, `status`, `admin-url`, and `dns-url`.
+If persisted values no longer match the existing container, lifecycle commands refuse to proceed and `status` reports the exact drift. Review it, then run `bin/adputate reconcile --yes`; named volumes are preserved.
 
-Changing these settings does not reconfigure an existing container yet. Stop and reset the container before recreating it with different publishing settings. `reset` preserves named-volume data; `uninstall --yes` deletes it.
+## The Publish Path
+
+The container is deliberately never given a privileged host port:
+
+```text
+LAN client :53 (UDP/TCP)
+  -> native LaunchDaemon frontend on <mac-lan-ip>:53
+  -> Apple Container publish on <mac-lan-ip>:5053
+  -> Pi-hole container :53
+
+Browser -> <mac-lan-ip>:18080 -> Pi-hole container :80
+```
+
+The native frontend opens only the configured LAN address, then drops from root to macOS's `nobody` account. It validates DNS transaction IDs, caps concurrent work, applies I/O timeouts, and forwards both UDP and TCP. Keeping Apple Container on an unprivileged backend port avoids relying on privileged publication inside its VM networking path and makes each layer independently testable.
 
 ## Health and Diagnostics
 
@@ -113,6 +129,7 @@ Changing these settings does not reconfigure an existing container yet. Stop and
 - The admin HTTP endpoint responds without using a configured host proxy.
 - DNS responds over UDP.
 - DNS responds over TCP.
+- When installed, the router-facing frontend responds over UDP and TCP on port 53.
 
 ## Verified Networking Behavior
 
@@ -120,12 +137,14 @@ The following behavior has been verified on the versions listed above:
 
 - LAN publishing on an unprivileged port works over TCP and UDP.
 - A second isolated container resolved external names through the Mac's LAN-facing listener.
+- A physically separate LAN machine passed external UDP, external TCP, blocked-domain, and admin HTTP checks against the unprivileged backend.
 - Pi-hole returned `0.0.0.0` for a domain on its blocklist.
 - Stopping the container makes `health` fail; restarting restores all health checks.
 - Direct publication of `127.0.0.1:53` collided with Apple Container's networking path.
 - Direct publication of a LAN address on port 53 was rejected because host ports below 1024 require root privileges.
+- The native frontend resolves and blocks locally over UDP and TCP port 53.
 
-Router-compatible service therefore needs a small privileged host component that forwards LAN TCP/UDP port 53 to Pi-hole's unprivileged published port. It must be supervised, preserve a recovery path, and be tested from a physically separate LAN client before router deployment.
+The final port-53 path must still be tested from a physically separate LAN client after `router-install`; local success cannot prove that a host firewall or network policy permits incoming traffic.
 
 ## Commands
 
@@ -134,7 +153,10 @@ doctor                      Validate prerequisites and configuration
 health                      Check API, HTTP, UDP DNS, and TCP DNS
 smoke                       Test registry access with a small ARM container
 init                        Create runtime configuration
+configure [options]         Persist desired runtime configuration
+config                      Print desired runtime configuration
 start | stop | restart      Manage the Pi-hole container
+reconcile --yes             Recreate a drifted container, preserving volumes
 status | logs | shell       Inspect the running service
 admin | admin-url           Open or print the admin endpoint
 dns-url                     Print the DNS endpoint
@@ -143,6 +165,12 @@ blocking-status             Report Pi-hole blocking state
 enable | disable [duration] Control Pi-hole blocking
 teleporter-export [dir]     Export a Teleporter archive
 teleporter-import <zip>     Import a Teleporter archive
+upgrade <image> --yes       Backup, upgrade, verify, and roll back on failure
+router-install              Install the supervised port-53 frontend
+router-status               Check UDP/TCP port 53
+router-uninstall            Remove the port-53 frontend
+dns-enable <service>        Save macOS DNS and use Adputate
+dns-disable                 Restore the saved macOS DNS configuration
 launchd-plist               Render the LaunchAgent plist
 service-install             Install and start the user LaunchAgent
 service-enable              Enable login startup
@@ -158,16 +186,12 @@ The LaunchAgent records an absolute path to the CLI. Run `bin/adputate service-i
 
 ## Milestone 0: Dependable Standalone Server
 
-Before paired-primary synchronization, the project still needs:
+The standalone server path is implemented. Before calling Milestone 0 production-ready, it still needs:
 
-- A supervised privileged TCP/UDP port-53 forwarding layer
-- Safe macOS DNS backup, enable, disable, and automatic restoration
-- Persistent runtime configuration and container-drift reconciliation
-- Readiness handling during startup
-- Backup-first image upgrade and rollback
-- Automated shell tests and macOS integration tests
-- Stable installation outside a source checkout
-- Reboot, sleep/wake, DHCP-address-change, and failure-injection testing
+- A successful UDP/TCP port-53 test from a physically separate LAN client
+- Reboot and sleep/wake testing with the LaunchAgent and LaunchDaemon installed
+- DHCP-address-change and deliberate backend/frontend failure testing
+- A stable installer outside a source checkout
 - Signed and notarized packaging
 
 After that milestone, planned work includes optional [Nebula Sync](https://github.com/lovelaze/nebula-sync) integration, primary-to-replica synchronization, drift detection, and health-aware failover. The dedicated Pi-hole should remain authoritative by default.
@@ -179,9 +203,13 @@ bin/adputate                         Shell CLI
 containers/manifest.toml            Deployment manifest
 containers/*.env.example            Configuration examples
 packaging/launchd/*.plist.template  LaunchAgent template
+packaging/router/                    Native port-53 proxy and installer
 project.env                          Project identity
-tests/                               Future automated tests
+tests/                               Shell integration tests
+.github/workflows/ci.yml             macOS CI
 ```
+
+Operational recovery procedures are in [Recovery](docs/recovery.md).
 
 ## Acknowledgements
 
