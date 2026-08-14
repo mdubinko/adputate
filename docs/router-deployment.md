@@ -5,8 +5,9 @@ Do not make Adputate the network's only resolver until every preflight check pas
 ## Preflight
 
 1. Give the Mac a DHCP reservation or static LAN address.
-2. Prevent sleep while it is serving DNS, or explicitly validate sleep/wake behavior for your setup.
-3. Persist the address and interface, then reconcile if required:
+2. Disconnect Cloudflare WARP and turn off iCloud Private Relay, or turn off **Limit IP Address Tracking** for this network. WARP may remain installed while disconnected.
+3. Prevent sleep while it is serving DNS, or explicitly validate sleep/wake behavior for your setup.
+4. Persist the address and interface, then reconcile if required:
 
    ```bash
    bin/adputate configure --bind-address <mac-lan-ip> --web-port 18080 \
@@ -14,7 +15,7 @@ Do not make Adputate the network's only resolver until every preflight check pas
    bin/adputate reconcile --yes
    ```
 
-4. Install both supervised services and verify local health:
+5. Install both supervised services and verify local health:
 
    ```bash
    bin/adputate service-install
@@ -38,7 +39,7 @@ If macOS asks whether to allow incoming network connections, allow them for the 
 
 The standard `mDNSResponder` wildcard listener is allowed because Adputate binds the exact configured IPv4 address. Another process on that exact address, or an unknown wildcard listener, fails installation with a remediation hint. A loopback-only listener is reported as a warning because it does not directly occupy the LAN address.
 
-VPN clients and Network Extensions can intercept or reroute DNS without owning a visible port-53 socket. Preflight therefore cannot prove their absence; successful UDP and TCP probes remain mandatory. Installation performs both probes and restores the previous frontend—or removes a new failed installation—if startup validation fails.
+VPN clients and Network Extensions can intercept or reroute DNS without owning a visible port-53 socket. Adputate explicitly stops installation when Cloudflare WARP is connected or iCloud Private Relay is active and asks you to turn it off; it does not modify either product. Other interceptors may not expose a reliable status interface, so successful UDP and TCP probes remain mandatory. Installation performs both probes and restores the previous frontend—or removes a new failed installation—if startup validation fails.
 
 ## Test from another LAN machine
 

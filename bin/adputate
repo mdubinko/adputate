@@ -399,6 +399,59 @@ EOF
   fi
 }
 
+warp_connected() {
+  local status="${ADPUTATE_WARP_STATUS:-}" warp_cli="${ADPUTATE_WARP_CLI:-}"
+
+  if [[ -z "$status" ]]; then
+    if [[ -z "$warp_cli" ]]; then
+      if command -v warp-cli >/dev/null 2>&1; then
+        warp_cli="$(command -v warp-cli)"
+      elif [[ -x "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli" ]]; then
+        warp_cli="/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli"
+      else
+        return 1
+      fi
+    fi
+    status="$("$warp_cli" status 2>/dev/null)" || return 1
+  fi
+
+  printf '%s\n' "$status" | grep -Eq '^Status( update)?: Connected[[:space:]]*$'
+}
+
+private_relay_enabled() {
+  local status="${ADPUTATE_PRIVATE_RELAY_STATUS:-}"
+
+  if [[ -z "$status" ]]; then
+    status="$(
+      defaults export com.apple.networkserviceproxy - 2>/dev/null |
+        plutil -extract NSPServiceStatusManagerInfo raw -o - - 2>/dev/null |
+        base64 -D 2>/dev/null |
+        plutil -p - 2>/dev/null |
+        awk '/"PrivacyProxyServiceStatus" =>/ { print $3; exit }'
+    )" || return 1
+  fi
+
+  [[ "$status" == "1" || "$status" == "true" || "$status" == "enabled" ]]
+}
+
+privacy_preflight() {
+  local blocked=0
+
+  if warp_connected; then
+    printf 'Cloudflare WARP is connected and is controlling this Mac\047s DNS path.\n' >&2
+    printf 'Turn WARP off, then rerun this command. Adputate will not change WARP settings.\n' >&2
+    blocked=1
+  fi
+  if private_relay_enabled; then
+    printf 'iCloud Private Relay is enabled and can bypass network DNS filtering.\n' >&2
+    printf 'Turn off Private Relay (or Limit IP Address Tracking for this network), then rerun this command.\n' >&2
+    printf 'Adputate will not change iCloud settings.\n' >&2
+    blocked=1
+  fi
+
+  (( blocked == 0 ))
+}
+
 CHECK_PASS_COUNT=0
 CHECK_WARN_COUNT=0
 CHECK_FAIL_COUNT=0
@@ -587,6 +640,17 @@ doctor() {
     check_warn "A macOS DNS backup is active; restore with: $CLI_NAME dns-disable"
   fi
 
+  if warp_connected; then
+    check_warn "Cloudflare WARP is connected and overrides this Mac's normal DNS path"
+  else
+    check_pass "Cloudflare WARP is not connected"
+  fi
+  if private_relay_enabled; then
+    check_warn "iCloud Private Relay is enabled and can bypass network DNS filtering"
+  else
+    check_pass "iCloud Private Relay is not enabled"
+  fi
+
   plist_path="$(launchd_plist_path)"
   if [[ -f "$plist_path" ]]; then
     installed_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist_path" 2>/dev/null || true)"
@@ -681,6 +745,7 @@ require_router_config() {
 
 router_preflight() {
   local helper
+  privacy_preflight || die "DNS privacy preflight failed"
   require_router_config
   helper="$(router_helper)"
   /usr/bin/sudo "$helper" preflight "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
@@ -688,6 +753,7 @@ router_preflight() {
 
 router_install() {
   local helper
+  privacy_preflight || die "DNS privacy preflight failed"
   require_router_config
   helper="$(router_helper)"
   backend_ready || die "Pi-hole backend is not healthy; run: $CLI_NAME health"
@@ -748,6 +814,7 @@ restore_dns_backup() {
 dns_enable() {
   local network_service="${1:-}" current line temporary
   local -a previous_dns=()
+  privacy_preflight || die "DNS privacy preflight failed"
   [[ -n "$network_service" ]] || die "Usage: $CLI_NAME dns-enable <network-service>"
   [[ ! -f "$DNS_BACKUP_FILE" ]] || die "A DNS backup is already active; run: $CLI_NAME dns-disable"
   [[ -f "$ROUTER_PLIST_PATH" ]] || die "Router-facing port 53 is not installed"
@@ -1100,6 +1167,7 @@ launchd_plist_path() {
 }
 
 service_install() {
+  privacy_preflight || die "DNS privacy preflight failed"
   ensure_dirs
   local plist_path
   plist_path="$(launchd_plist_path)"

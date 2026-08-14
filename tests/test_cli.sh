@@ -84,6 +84,25 @@ assert_contains "$output" 'router-install'
 assert_contains "$output" 'router-preflight'
 assert_contains "$output" 'upgrade <image> --yes'
 
+if ADPUTATE_WARP_STATUS='Status update: Connected' "$CLI" router-preflight >"$TEST_TMP/warp.out" 2>&1; then
+  fail 'router preflight accepted an active Cloudflare WARP connection'
+fi
+assert_contains "$(cat "$TEST_TMP/warp.out")" 'Cloudflare WARP is connected'
+assert_contains "$(cat "$TEST_TMP/warp.out")" 'Turn WARP off'
+
+for install_command in service-install router-install dns-enable; do
+  if ADPUTATE_WARP_STATUS='Status update: Connected' "$CLI" "$install_command" >"$TEST_TMP/$install_command.out" 2>&1; then
+    fail "$install_command accepted an active Cloudflare WARP connection"
+  fi
+  assert_contains "$(cat "$TEST_TMP/$install_command.out")" 'Cloudflare WARP is connected'
+done
+
+if ADPUTATE_PRIVATE_RELAY_STATUS=1 "$CLI" router-preflight >"$TEST_TMP/private-relay.out" 2>&1; then
+  fail 'router preflight accepted active iCloud Private Relay'
+fi
+assert_contains "$(cat "$TEST_TMP/private-relay.out")" 'iCloud Private Relay is enabled'
+assert_contains "$(cat "$TEST_TMP/private-relay.out")" 'Limit IP Address Tracking'
+
 $CLI configure --bind-address 127.0.0.1 --web-port 19080 --dns-port 15053 \
   --image pihole/pihole:2026.07.2 --memory 256M >/dev/null
 [[ -f "$ADPUTATE_APP_DIR/config/runtime.env" ]] || fail 'runtime configuration was not created'

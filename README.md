@@ -41,6 +41,8 @@ The implementation has been tested with:
 
 Install Apple Container from its signed release package, start its system service, and confirm that `container --version` works before using Adputate.
 
+Before installation, disconnect Cloudflare WARP and turn off iCloud Private Relay (or turn off **Limit IP Address Tracking** for the active network). Both can take control of macOS DNS independently of the DNS servers shown in Network settings. Adputate's service, router frontend, and macOS DNS installation commands stop before making changes when either override is active; they never change those products' settings themselves. WARP may remain installed while disconnected.
+
 ## Quick Start
 
 ```bash
@@ -121,6 +123,7 @@ The native frontend opens only the configured LAN address, then drops from root 
 - Image pinning
 - Runtime data-path writability
 - Stale or missing LaunchAgent configuration
+- Active Cloudflare WARP or iCloud Private Relay DNS-path overrides
 
 `health` returns a nonzero status unless all of these checks pass:
 
