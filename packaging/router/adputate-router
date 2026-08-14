@@ -281,8 +281,9 @@ install_forwarder() {
 uninstall_forwarder() {
   [[ "$EUID" -eq 0 ]] || { printf 'Run this helper as root.\n' >&2; exit 1; }
   /bin/launchctl bootout system "$plist" >/dev/null 2>&1 || true
-  /bin/rm -f "$plist" "$proxy" "$legacy_loader" "$legacy_pf_file" "$log_file"
-  /bin/rmdir "$support_dir" >/dev/null 2>&1 || true
+  /usr/libexec/ApplicationFirewall/socketfilterfw --remove "$proxy" >/dev/null 2>&1 || true
+  /bin/rm -f "$plist" "$log_file"
+  /bin/rm -rf "$support_dir"
   printf 'Removed %s.\n' "$service_label"
 }
 

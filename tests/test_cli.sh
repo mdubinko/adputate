@@ -18,7 +18,9 @@ assert_contains() {
 
 FAKE_CONTAINER="$TEST_TMP/container"
 FAKE_STATE_FILE="$TEST_TMP/container-state"
+FAKE_IMAGE_FILE="$TEST_TMP/container-images"
 printf 'missing\n' >"$FAKE_STATE_FILE"
+printf 'pihole/pihole:2026.07.2\n' >"$FAKE_IMAGE_FILE"
 
 cat >"$FAKE_CONTAINER" <<'EOF'
 #!/usr/bin/env bash
@@ -28,9 +30,9 @@ case "${1:-}" in
   --version) printf 'container CLI version 1.2.2 (test)\n' ;;
   list)
     if [[ " $* " == *" --all "* ]]; then
-      [[ "$state" == "missing" ]] || printf 'adputate-pihole\n'
+      [[ "$state" == "missing" ]] || printf '%s\n' "$FAKE_CONTAINER_NAME"
     else
-      [[ "$state" == "running" ]] && printf 'adputate-pihole\n'
+      [[ "$state" == "running" ]] && printf '%s\n' "$FAKE_CONTAINER_NAME"
     fi
     ;;
   inspect)
@@ -40,6 +42,16 @@ JSON
     ;;
   volume)
     [[ "${2:-}" == "inspect" ]] && exit 1
+    ;;
+  image)
+    case "${2:-}" in
+      inspect) grep -Fxq "${3:-}" "$FAKE_IMAGE_FILE" ;;
+      delete)
+        grep -Fvx "${3:-}" "$FAKE_IMAGE_FILE" >"$FAKE_IMAGE_FILE.new" || true
+        mv "$FAKE_IMAGE_FILE.new" "$FAKE_IMAGE_FILE"
+        ;;
+      *) exit 0 ;;
+    esac
     ;;
   system) exit 0 ;;
   run) printf 'running\n' >"$FAKE_STATE_FILE" ;;
@@ -56,7 +68,14 @@ chmod +x "$FAKE_CONTAINER"
 export HOME="$TEST_TMP/home"
 export ADPUTATE_APP_DIR="$TEST_TMP/app"
 export CONTAINER_BIN="$FAKE_CONTAINER"
-export FAKE_STATE_FILE
+export ADPUTATE_CONTAINER_NAME="adputate-test-pihole"
+export ADPUTATE_SERVICE_LABEL="com.adputate.test.pihole"
+export ADPUTATE_ROUTER_SERVICE_LABEL="com.adputate.test.dns-forwarder"
+export ADPUTATE_ROUTER_SUPPORT_DIR="$TEST_TMP/router-support"
+export ADPUTATE_ROUTER_PLIST_PATH="$TEST_TMP/com.adputate.test.dns-forwarder.plist"
+export ADPUTATE_ROUTER_LOG_PATH="$TEST_TMP/adputate-dns-forwarder.log"
+export FAKE_STATE_FILE FAKE_IMAGE_FILE
+export FAKE_CONTAINER_NAME="$ADPUTATE_CONTAINER_NAME"
 mkdir -p "$HOME/Library/Application Support"
 
 output="$($CLI help)"
@@ -123,6 +142,7 @@ assert_contains "$(cat "$TEST_TMP/unknown.out")" 'identify it by PID'
 listener_output="$(printf 'TCP\tadputate-\t99\tnobody\t192.0.2.10:53\n' | \
   "$PROJECT_ROOT/packaging/router/adputate-router" classify 192.0.2.10 99)"
 assert_contains "$listener_output" 'currently installed Adputate frontend'
+assert_contains "$(cat "$PROJECT_ROOT/packaging/router/adputate-router")" 'socketfilterfw --remove'
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   /usr/bin/xcrun clang -O2 -Wall -Wextra -Werror -pthread \
@@ -132,4 +152,25 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   fi
 fi
 
-printf 'PASS: CLI, drift, health-failure, port-conflict, privilege, and proxy-build tests\n'
+mkdir -p "$ADPUTATE_APP_DIR/data"
+printf 'stopped\n' >"$FAKE_STATE_FILE"
+output="$($CLI uninstall --yes)"
+assert_contains "$output" 'Adputate uninstall completed cleanly'
+[[ ! -e "$ADPUTATE_APP_DIR" ]] || fail 'uninstall retained the application data directory'
+[[ "$(cat "$FAKE_STATE_FILE")" == "missing" ]] || fail 'uninstall retained the container'
+if grep -Fxq 'pihole/pihole:2026.07.2' "$FAKE_IMAGE_FILE"; then
+  fail 'uninstall retained the configured Pi-hole image'
+fi
+output="$($CLI uninstall-audit)"
+assert_contains "$output" '0 failed'
+
+$CLI configure --bind-address 127.0.0.1 --web-port 19080 --dns-port 15053 \
+  --image pihole/pihole:2026.07.2 --memory 256M >/dev/null
+[[ -f "$ADPUTATE_APP_DIR/config/runtime.env" ]] || fail 'fresh configuration failed after uninstall'
+printf 'pihole/pihole:2026.07.2\n' >"$FAKE_IMAGE_FILE"
+output="$($CLI uninstall --yes --keep-images)"
+assert_contains "$output" 'deliberately retained'
+grep -Fxq 'pihole/pihole:2026.07.2' "$FAKE_IMAGE_FILE" || fail '--keep-images removed the Pi-hole image'
+[[ ! -e "$ADPUTATE_APP_DIR" ]] || fail '--keep-images retained application data'
+
+printf 'PASS: CLI, drift, health-failure, port-conflict, clean-uninstall, privilege, and proxy-build tests\n'

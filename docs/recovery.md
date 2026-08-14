@@ -20,6 +20,17 @@ bin/adputate router-uninstall
 
 This removes only Adputate's system LaunchDaemon and installed proxy. It does not delete Pi-hole data.
 
+## Remove Adputate completely
+
+Restore any router DHCP/DNS setting first, then run:
+
+```bash
+bin/adputate uninstall --yes
+bin/adputate uninstall-audit
+```
+
+The uninstall restores DNS previously changed by `dns-enable`, removes both launchd jobs, removes the Application Firewall entry, deletes the container, volumes, runtime files, logs, and Adputate-used image cache. It does not remove the source checkout or Apple's Container installation. Use `--keep-images` only when retaining the cache is intentional.
+
 ## Recover a stopped or unhealthy backend
 
 ```bash

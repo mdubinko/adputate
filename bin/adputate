@@ -31,19 +31,25 @@ fi
 CONTAINER_NAME="${ADPUTATE_CONTAINER_NAME:-${CLI_NAME}-pihole}"
 SERVICE_LABEL="${ADPUTATE_SERVICE_LABEL:-com.${CLI_NAME}.pihole}"
 IMAGE="${ADPUTATE_IMAGE:-${ADPUTATE_CONFIG_IMAGE:-pihole/pihole:2026.07.2}}"
+SMOKE_IMAGE="${ADPUTATE_SMOKE_IMAGE:-alpine:3.22}"
 MEMORY="${ADPUTATE_MEMORY:-${ADPUTATE_CONFIG_MEMORY:-256M}}"
 ENV_FILE="$CONFIG_DIR/pihole.env"
 LOG_DIR="$APP_DIR/logs"
 TELEPORTER_DIR="$APP_DIR/teleporter"
 DNS_BACKUP_FILE="$CONFIG_DIR/dns-backup.env"
+OWNED_IMAGES_FILE="$DATA_DIR/owned-images"
+CONTAINER_SYSTEM_MARKER="$DATA_DIR/started-container-system"
 ETC_PIHOLE_VOLUME="${ADPUTATE_ETC_PIHOLE_VOLUME:-${CLI_NAME}-etc-pihole}"
 ETC_DNSMASQ_VOLUME="${ADPUTATE_ETC_DNSMASQ_VOLUME:-${CLI_NAME}-etc-dnsmasq.d}"
 HOST_WEB_PORT="${ADPUTATE_WEB_PORT:-${ADPUTATE_CONFIG_WEB_PORT:-8080}}"
 HOST_DNS_PORT="${ADPUTATE_DNS_PORT:-${ADPUTATE_CONFIG_DNS_PORT:-5053}}"
 HOST_BIND_ADDRESS="${ADPUTATE_BIND_ADDRESS:-${ADPUTATE_CONFIG_BIND_ADDRESS:-127.0.0.1}}"
 ROUTER_INTERFACE="${ADPUTATE_ROUTER_INTERFACE:-${ADPUTATE_CONFIG_ROUTER_INTERFACE:-}}"
-ROUTER_SERVICE_LABEL="com.${CLI_NAME}.dns-forwarder"
-ROUTER_PLIST_PATH="/Library/LaunchDaemons/$ROUTER_SERVICE_LABEL.plist"
+ROUTER_SERVICE_LABEL="${ADPUTATE_ROUTER_SERVICE_LABEL:-com.${CLI_NAME}.dns-forwarder}"
+ROUTER_SUPPORT_DIR="${ADPUTATE_ROUTER_SUPPORT_DIR:-/Library/Application Support/$APP_NAME}"
+ROUTER_PLIST_PATH="${ADPUTATE_ROUTER_PLIST_PATH:-/Library/LaunchDaemons/$ROUTER_SERVICE_LABEL.plist}"
+ROUTER_PROXY_PATH="$ROUTER_SUPPORT_DIR/adputate-dns-proxy"
+ROUTER_LOG_PATH="${ADPUTATE_ROUTER_LOG_PATH:-/var/log/adputate-dns-forwarder.log}"
 
 usage() {
   cat <<'EOF'
@@ -107,7 +113,11 @@ Commands:
   upgrade <image> --yes
               Back up, recreate on a pinned image, and roll back on failure.
   reset        Delete the container but keep persistent Pi-hole data.
-  uninstall    Delete the container and local persistent data. Requires --yes.
+  uninstall --yes [--keep-images]
+               Restore DNS and remove installed services and persistent data.
+               Also removes Adputate images unless --keep-images is supplied.
+  uninstall-audit
+               Report any installed Adputate artifacts that remain.
 
 Default endpoints (override with ADPUTATE_BIND_ADDRESS, ADPUTATE_WEB_PORT,
 and ADPUTATE_DNS_PORT):
@@ -215,6 +225,20 @@ container_current_image() {
 
 volume_exists() {
   "$CONTAINER_BIN" volume inspect "$1" >/dev/null 2>&1
+}
+
+image_exists() {
+  "$CONTAINER_BIN" image inspect "$1" >/dev/null 2>&1
+}
+
+record_owned_image_if_missing() {
+  local image="$1"
+  image_exists "$image" && return 0
+  ensure_dirs
+  if [[ ! -f "$OWNED_IMAGES_FILE" ]] || ! grep -Fxq "$image" "$OWNED_IMAGES_FILE"; then
+    printf '%s\n' "$image" >>"$OWNED_IMAGES_FILE"
+    chmod 600 "$OWNED_IMAGES_FILE"
+  fi
 }
 
 ensure_volumes() {
@@ -775,16 +799,21 @@ smoke() {
     die "Cannot reach registry-1.docker.io. Container image pulls will fail until host DNS/network access is fixed."
   fi
   printf 'Running tiny ARM container...\n'
-  "$CONTAINER_BIN" run --rm --platform linux/arm64 alpine:3.22 uname -m
+  record_owned_image_if_missing "$SMOKE_IMAGE"
+  "$CONTAINER_BIN" run --rm --platform linux/arm64 "$SMOKE_IMAGE" uname -m
 }
 
 start_container_system() {
   container_service_reachable && return
   "$CONTAINER_BIN" system start >/dev/null
   container_service_reachable || die "Apple container service did not become reachable"
+  ensure_dirs
+  : >"$CONTAINER_SYSTEM_MARKER"
+  chmod 600 "$CONTAINER_SYSTEM_MARKER"
 }
 
 create_pihole() {
+  record_owned_image_if_missing "$IMAGE"
   "$CONTAINER_BIN" run \
     --detach \
     --name "$CONTAINER_NAME" \
@@ -1029,6 +1058,7 @@ upgrade_pihole() {
   printf 'Creating pre-upgrade Teleporter backup...\n'
   teleporter_export "$backup_dir"
   printf 'Pulling %s...\n' "$target_image"
+  record_owned_image_if_missing "$target_image"
   "$CONTAINER_BIN" image pull "$target_image"
 
   "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -1079,7 +1109,6 @@ service_install() {
 
   launchctl bootout "$(launchd_domain)" "$plist_path" >/dev/null 2>&1 || true
   launchctl bootstrap "$(launchd_domain)" "$plist_path"
-  launchctl enable "$(launchd_domain)/$SERVICE_LABEL" >/dev/null 2>&1 || true
   launchctl kickstart -k "$(launchd_domain)/$SERVICE_LABEL" >/dev/null 2>&1 || true
   printf 'Installed %s at %s\n' "$SERVICE_LABEL" "$plist_path"
 }
@@ -1152,15 +1181,151 @@ service_status() {
   printf 'last exit: %s\n' "${last_exit:-unknown}"
 }
 
+uninstall_audit() {
+  local keep_images="${1:-0}" firewall_apps disabled_output audit_image
+  reset_checks
+
+  [[ ! -e "$DNS_BACKUP_FILE" ]] && check_pass "No active macOS DNS backup" || \
+    check_fail "macOS DNS backup remains at $DNS_BACKUP_FILE"
+  [[ ! -e "$ROUTER_PLIST_PATH" ]] && check_pass "No router LaunchDaemon plist" || \
+    check_fail "Router LaunchDaemon plist remains at $ROUTER_PLIST_PATH"
+  if /bin/launchctl print "system/$ROUTER_SERVICE_LABEL" >/dev/null 2>&1; then
+    check_fail "Router LaunchDaemon remains loaded"
+  else
+    check_pass "Router LaunchDaemon is not loaded"
+  fi
+  [[ ! -e "$ROUTER_SUPPORT_DIR" ]] && check_pass "No privileged Adputate support directory" || \
+    check_fail "Privileged support directory remains at $ROUTER_SUPPORT_DIR"
+  [[ ! -e "$ROUTER_LOG_PATH" ]] && check_pass "No router frontend log" || \
+    check_fail "Router frontend log remains"
+
+  firewall_apps="$(/usr/libexec/ApplicationFirewall/socketfilterfw --listapps 2>/dev/null || true)"
+  if grep -Fq "$ROUTER_PROXY_PATH" <<<"$firewall_apps"; then
+    check_fail "Application Firewall registration remains for $ROUTER_PROXY_PATH"
+  else
+    check_pass "No Adputate Application Firewall registration"
+  fi
+
+  local plist_path
+  plist_path="$(launchd_plist_path)"
+  [[ ! -e "$plist_path" ]] && check_pass "No user LaunchAgent plist" || \
+    check_fail "User LaunchAgent plist remains at $plist_path"
+  if /bin/launchctl print "$(launchd_domain)/$SERVICE_LABEL" >/dev/null 2>&1; then
+    check_fail "User LaunchAgent remains loaded"
+  else
+    check_pass "User LaunchAgent is not loaded"
+  fi
+
+  if command -v "$CONTAINER_BIN" >/dev/null 2>&1 && container_service_reachable; then
+    container_exists && check_fail "$CONTAINER_NAME still exists" || check_pass "No Adputate container"
+    volume_exists "$ETC_PIHOLE_VOLUME" && check_fail "$ETC_PIHOLE_VOLUME still exists" || check_pass "No Pi-hole volume"
+    volume_exists "$ETC_DNSMASQ_VOLUME" && check_fail "$ETC_DNSMASQ_VOLUME still exists" || check_pass "No dnsmasq volume"
+    for audit_image in "$IMAGE" "$SMOKE_IMAGE"; do
+      if image_exists "$audit_image"; then
+        if [[ "$keep_images" == "1" ]]; then
+          check_warn "Container image was deliberately retained: $audit_image"
+        else
+          check_fail "Adputate-used image remains cached: $audit_image"
+        fi
+      else
+        check_pass "Adputate-used image is not cached: $audit_image"
+      fi
+    done
+  else
+    check_warn "Apple Container is absent or stopped; container, volume, and image cleanup cannot be verified"
+  fi
+
+  [[ ! -e "$APP_DIR" ]] && check_pass "No Adputate user runtime directory" || \
+    check_fail "User runtime directory remains at $APP_DIR"
+
+  disabled_output="$(/bin/launchctl print-disabled "$(launchd_domain)" 2>/dev/null || true)"
+  if grep -Fq "\"$SERVICE_LABEL\"" <<<"$disabled_output"; then
+    check_warn "launchd retains an enable/disable preference for $SERVICE_LABEL; macOS has no safe per-service reset command"
+  fi
+  check_summary
+}
+
 uninstall() {
-  [[ "${1:-}" == "--yes" ]] || die "Refusing to remove data without --yes."
-  [[ ! -f "$DNS_BACKUP_FILE" ]] || die "Restore macOS DNS first: $CLI_NAME dns-disable"
-  [[ ! -f "$ROUTER_PLIST_PATH" ]] || die "Remove the router frontend first: $CLI_NAME router-uninstall"
+  local confirmed=0 keep_images=0 argument current_image="" image image_list cleanup_failed=0
+  local system_started_for_cleanup=0 stop_owned_system=0 other_containers firewall_apps
+  for argument in "$@"; do
+    case "$argument" in
+      --yes) confirmed=1 ;;
+      --keep-images) keep_images=1 ;;
+      *) die "Unknown uninstall option: $argument" ;;
+    esac
+  done
+  (( confirmed == 1 )) || die "Refusing to remove data without --yes."
+  require_container
+  if ! container_service_reachable; then
+    "$CONTAINER_BIN" system start >/dev/null
+    container_service_reachable || die "Apple Container service could not be started for cleanup"
+    system_started_for_cleanup=1
+  fi
+  [[ -f "$CONTAINER_SYSTEM_MARKER" ]] && stop_owned_system=1
+
+  image_list="$(mktemp "${TMPDIR:-/tmp}/adputate-uninstall-images.XXXXXX")"
+  printf '%s\n%s\n' "$IMAGE" "$SMOKE_IMAGE" >"$image_list"
+  if [[ -f "$OWNED_IMAGES_FILE" ]]; then
+    while IFS= read -r image; do
+      [[ -n "$image" ]] && printf '%s\n' "$image" >>"$image_list"
+    done <"$OWNED_IMAGES_FILE"
+  fi
+  if container_exists; then
+    current_image="$(container_current_image || true)"
+    [[ -n "$current_image" ]] && printf '%s\n' "$current_image" >>"$image_list"
+  fi
+  /usr/bin/sort -u -o "$image_list" "$image_list"
+
+  if [[ -f "$DNS_BACKUP_FILE" ]]; then
+    printf 'Restoring the previous macOS DNS configuration...\n'
+    dns_disable
+  fi
+  firewall_apps="$(/usr/libexec/ApplicationFirewall/socketfilterfw --listapps 2>/dev/null || true)"
+  if [[ -e "$ROUTER_PLIST_PATH" || -e "$ROUTER_SUPPORT_DIR" || -e "$ROUTER_LOG_PATH" ]] || \
+      /bin/launchctl print "system/$ROUTER_SERVICE_LABEL" >/dev/null 2>&1 || \
+      grep -Fq "$ROUTER_PROXY_PATH" <<<"$firewall_apps"; then
+    printf 'Removing the privileged port-53 frontend...\n'
+    router_uninstall
+  fi
   service_uninstall >/dev/null 2>&1 || true
   reset_container
   "$CONTAINER_BIN" volume delete "$ETC_PIHOLE_VOLUME" >/dev/null 2>&1 || true
   "$CONTAINER_BIN" volume delete "$ETC_DNSMASQ_VOLUME" >/dev/null 2>&1 || true
-  rm -rf "$APP_DIR"
+  volume_exists "$ETC_PIHOLE_VOLUME" && cleanup_failed=1
+  volume_exists "$ETC_DNSMASQ_VOLUME" && cleanup_failed=1
+
+  if (( keep_images == 0 )); then
+    while IFS= read -r image; do
+      [[ -n "$image" ]] || continue
+      if image_exists "$image"; then
+        printf 'Removing cached image %s...\n' "$image"
+        if ! "$CONTAINER_BIN" image delete "$image"; then
+          printf 'Could not remove shared or in-use image: %s\n' "$image" >&2
+          cleanup_failed=1
+        fi
+      fi
+    done <"$image_list"
+  fi
+  rm -f "$image_list"
+
+  [[ -n "$APP_DIR" && "$APP_DIR" != "/" && "$APP_DIR" != "$HOME" && ${#APP_DIR} -gt 8 ]] || \
+    die "Refusing to remove unsafe application data path: $APP_DIR"
+  if (( cleanup_failed == 0 )); then
+    rm -rf -- "$APP_DIR"
+  else
+    printf 'Retaining %s so cleanup can be retried.\n' "$APP_DIR" >&2
+  fi
+
+  printf 'Auditing uninstall...\n'
+  uninstall_audit "$keep_images" || cleanup_failed=1
+  other_containers="$("$CONTAINER_BIN" list --all --quiet 2>/dev/null || true)"
+  if [[ -z "$other_containers" && ( "$system_started_for_cleanup" == "1" || "$stop_owned_system" == "1" ) ]]; then
+    printf 'Restoring Apple Container services to their pre-Adputate stopped state...\n'
+    "$CONTAINER_BIN" system stop >/dev/null || cleanup_failed=1
+  fi
+  (( cleanup_failed == 0 )) || die "Uninstall completed with artifacts that require attention"
+  printf 'Adputate uninstall completed cleanly. The source checkout and external router settings were not changed.\n'
 }
 
 main() {
@@ -1203,7 +1368,8 @@ main() {
     dns-disable) dns_disable ;;
     upgrade) shift; upgrade_pihole "${1:-}" "${2:-}" ;;
     reset) reset_container ;;
-    uninstall) shift; uninstall "${1:-}" ;;
+    uninstall) shift; uninstall "$@" ;;
+    uninstall-audit) uninstall_audit ;;
     -h|--help|help|"") render_usage ;;
     *) render_usage; exit 64 ;;
   esac

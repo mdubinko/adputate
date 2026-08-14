@@ -180,10 +180,28 @@ service-kick                Run the installed job now
 service-status              Report LaunchAgent state
 service-uninstall           Remove the user LaunchAgent
 reset                       Delete the container but preserve volumes
-uninstall --yes             Delete the container, volumes, and runtime data
+uninstall --yes             Restore DNS and remove services, data, and images
+uninstall --yes --keep-images
+                            Remove everything except cached container images
+uninstall-audit             Report any Adputate artifacts still installed
 ```
 
 The LaunchAgent records an absolute path to the CLI. Run `bin/adputate service-install` again after moving or renaming the checkout.
+
+## Clean Uninstall
+
+`uninstall --yes` is designed to return the Mac to a state suitable for testing a fresh installation:
+
+```bash
+bin/adputate uninstall --yes
+bin/adputate uninstall-audit
+```
+
+It restores DNS saved by `dns-enable`, removes the system LaunchDaemon and Application Firewall registration, removes the user LaunchAgent, deletes the container and named volumes, removes runtime configuration/backups/logs, and deletes the Pi-hole and smoke-test images. Images that are still used by another container are retained and reported as a cleanup failure rather than being forcibly deleted.
+
+Use `--keep-images` when the image cache is intentionally shared. Adputate stops Apple Container services only when it recorded that it started them and no other containers remain.
+
+The source checkout and Apple Container installation are not removed. Router DHCP/DNS settings are external and must be restored separately. macOS may retain ordinary unified logs and a harmless historical launchd enable/disable preference; `uninstall-audit` reports the latter as a warning.
 
 ## Milestone 0: Dependable Standalone Server
 
