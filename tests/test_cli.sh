@@ -62,6 +62,7 @@ mkdir -p "$HOME/Library/Application Support"
 output="$($CLI help)"
 assert_contains "$output" 'configure [options]'
 assert_contains "$output" 'router-install'
+assert_contains "$output" 'router-preflight'
 assert_contains "$output" 'upgrade <image> --yes'
 
 $CLI configure --bind-address 127.0.0.1 --web-port 19080 --dns-port 15053 \
@@ -94,6 +95,35 @@ if "$PROJECT_ROOT/packaging/router/adputate-router" install 127.0.0.1 15053 en0 
   fail 'router helper ran without root privileges'
 fi
 
+listener_output="$(printf 'TCP\tmDNSRespo\t735\t_mdnsresponder\t*:53\n' | \
+  "$PROJECT_ROOT/packaging/router/adputate-router" classify 192.0.2.10)"
+assert_contains "$listener_output" 'expected wildcard listener'
+assert_contains "$listener_output" 'Allowing the standard macOS wildcard listener'
+
+if printf 'UDP\tdnsmasq\t42\troot\t192.0.2.10:53\n' | \
+    "$PROJECT_ROOT/packaging/router/adputate-router" classify 192.0.2.10 \
+    >"$TEST_TMP/dnsmasq.out" 2>&1; then
+  fail 'listener classifier accepted dnsmasq on the target address'
+fi
+assert_contains "$(cat "$TEST_TMP/dnsmasq.out")" 'brew services list'
+assert_contains "$(cat "$TEST_TMP/dnsmasq.out")" 'conflicts with 192.0.2.10:53/UDP'
+
+listener_output="$(printf 'UDP\tDocker\t43\ttest\t127.0.0.1:53\n' | \
+  "$PROJECT_ROOT/packaging/router/adputate-router" classify 192.0.2.10)"
+assert_contains "$listener_output" 'Docker Desktop'
+assert_contains "$listener_output" 'does not directly occupy 192.0.2.10:53'
+
+if printf 'TCP\tunknown-dns\t44\troot\t*:53\n' | \
+    "$PROJECT_ROOT/packaging/router/adputate-router" classify 192.0.2.10 \
+    >"$TEST_TMP/unknown.out" 2>&1; then
+  fail 'listener classifier accepted an unknown wildcard listener'
+fi
+assert_contains "$(cat "$TEST_TMP/unknown.out")" 'identify it by PID'
+
+listener_output="$(printf 'TCP\tadputate-\t99\tnobody\t192.0.2.10:53\n' | \
+  "$PROJECT_ROOT/packaging/router/adputate-router" classify 192.0.2.10 99)"
+assert_contains "$listener_output" 'currently installed Adputate frontend'
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
   /usr/bin/xcrun clang -O2 -Wall -Wextra -Werror -pthread \
     "$PROJECT_ROOT/packaging/router/adputate-dns-proxy.c" -o "$TEST_TMP/adputate-dns-proxy"
@@ -102,4 +132,4 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   fi
 fi
 
-printf 'PASS: CLI configuration, drift, health-failure, plist, privilege, and proxy-build tests\n'
+printf 'PASS: CLI, drift, health-failure, port-conflict, privilege, and proxy-build tests\n'

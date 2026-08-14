@@ -167,6 +167,7 @@ teleporter-export [dir]     Export a Teleporter archive
 teleporter-import <zip>     Import a Teleporter archive
 upgrade <image> --yes       Backup, upgrade, verify, and roll back on failure
 router-install              Install the supervised port-53 frontend
+router-preflight            Diagnose port-53 owners and DNS interceptors
 router-status               Check UDP/TCP port 53
 router-uninstall            Remove the port-53 frontend
 dns-enable <service>        Save macOS DNS and use Adputate

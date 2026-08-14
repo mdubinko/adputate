@@ -95,6 +95,8 @@ Commands:
               Import a Pi-hole Teleporter ZIP.
   router-install
               Install the native TCP/UDP port-53 frontend.
+  router-preflight
+              Diagnose port-53 owners and common DNS interceptors.
   router-status
               Check the router-facing port-53 path.
   router-uninstall
@@ -643,7 +645,7 @@ router_helper() {
   printf '%s/packaging/router/adputate-router' "$PROJECT_ROOT"
 }
 
-router_install() {
+require_router_config() {
   local helper
   helper="$(router_helper)"
   [[ -x "$helper" ]] || die "Router helper not found or not executable: $helper"
@@ -651,10 +653,27 @@ router_install() {
   valid_port "$HOST_DNS_PORT" && (( 10#$HOST_DNS_PORT >= 1024 )) || \
     die "Configure an unprivileged DNS backend port first"
   [[ -n "$ROUTER_INTERFACE" ]] || die "Configure a LAN interface first"
+}
+
+router_preflight() {
+  local helper
+  require_router_config
+  helper="$(router_helper)"
+  /usr/bin/sudo "$helper" preflight "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
+}
+
+router_install() {
+  local helper
+  require_router_config
+  helper="$(router_helper)"
   backend_ready || die "Pi-hole backend is not healthy; run: $CLI_NAME health"
   printf 'Installing a root LaunchDaemon for the native port-53 frontend.\n'
   /usr/bin/sudo "$helper" install "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
-  router_status
+  if ! router_status; then
+    printf 'Post-install DNS probes failed; removing the failed frontend.\n' >&2
+    /usr/bin/sudo "$helper" uninstall "" "" "" "$ROUTER_SERVICE_LABEL" || true
+    die "Router frontend installation was rolled back"
+  fi
 }
 
 router_status() {
@@ -1177,6 +1196,7 @@ main() {
     teleporter-export) shift; teleporter_export "${1:-}" ;;
     teleporter-import) shift; teleporter_import "${1:-}" ;;
     router-install) router_install ;;
+    router-preflight) router_preflight ;;
     router-status) router_status ;;
     router-uninstall) router_uninstall ;;
     dns-enable) shift; dns_enable "${1:-}" ;;
