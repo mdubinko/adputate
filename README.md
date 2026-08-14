@@ -96,6 +96,31 @@ bin/adputate start
 
 If persisted values no longer match the existing container, lifecycle commands refuse to proceed and `status` reports the exact drift. Review it, then run `bin/adputate reconcile --yes`; named volumes are preserved.
 
+## Network Architecture and Trust
+
+Adputate has two distinct DNS roles:
+
+```text
+Mac applications
+  -> every physical macOS network service uses 127.0.0.1:53
+  -> host-only native frontend
+  -> Pi-hole on an unprivileged loopback backend port
+
+LAN clients
+  -> one explicitly trusted, stable LAN address on port 53
+  -> router-facing native frontend
+  -> the same Pi-hole backend
+```
+
+The host-only path is intended to follow the Mac between Wi-Fi, Ethernet, and untrusted networks without exposing DNS to those networks. Adputate should back up and configure every physical macOS network service to use the loopback listener. VPN-created and other virtual services are not changed automatically because they may require scoped or organization-managed DNS. A newly installed physical network service should be reported by `doctor` until it is protected or explicitly excluded.
+
+The router-facing path is different: it listens on exactly one explicitly trusted LAN address, never on every interface or a wildcard address. That address needs a DHCP reservation or static assignment before a router advertises it to clients. Moving between Wi-Fi and USB Ethernet does not require exposing DNS on both; both host network services continue to use the local loopback path, while the router continues to use the one stable server path. That selected link—normally Ethernet for a server—must remain connected for LAN clients; automatic router-facing failover is not implied.
+
+This policy deliberately has no public secondary resolver. macOS clients do not reliably treat listed DNS servers as ordered primary and fallback choices, so adding one could silently bypass blocking. If the local service is unhealthy, DNS should fail visibly and recovery or uninstall should restore the exact saved settings.
+
+> [!IMPORTANT]
+> This is the target architecture. The current milestone implementation still uses one bind address for the Pi-hole backend and router frontend, and `dns-enable` manages one macOS network service at a time. A loopback frontend plus transactional multi-service DNS configuration must be implemented and tested before roaming protection is complete.
+
 ## The Publish Path
 
 The container is deliberately never given a privileged host port:
