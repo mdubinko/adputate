@@ -7,12 +7,15 @@
   <key>ProgramArguments</key>
   <array>
     <string>__ADPUTATE_BIN__</string>
-    <string>start</string>
+    <string>host</string>
+    <string>ensure</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <false/>
+  <key>StartInterval</key>
+  <integer>60</integer>
   <key>StandardOutPath</key>
   <string>__ADPUTATE_LOG_DIR__/launchd.out.log</string>
   <key>StandardErrorPath</key>

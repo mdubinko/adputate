@@ -5,7 +5,7 @@ Keep this path available before changing router or macOS DNS settings.
 ## Restore this Mac's DNS
 
 ```bash
-bin/adputate dns-disable
+adputate client dns restore --yes
 ```
 
 If the checkout is unavailable, inspect `~/Library/Application Support/Adputate/config/dns-backup.env`, then restore the recorded service in System Settings or with `networksetup -setdnsservers`. Do not delete the backup until the prior configuration is restored.
@@ -15,7 +15,7 @@ If the checkout is unavailable, inspect `~/Library/Application Support/Adputate/
 First point the router and this Mac at another resolver. Then run:
 
 ```bash
-bin/adputate router-uninstall
+adputate host router uninstall
 ```
 
 This removes only Adputate's system LaunchDaemon and installed proxy. It does not delete Pi-hole data.
@@ -25,27 +25,27 @@ This removes only Adputate's system LaunchDaemon and installed proxy. It does no
 Restore any router DHCP/DNS setting first, then run:
 
 ```bash
-bin/adputate uninstall --yes
-bin/adputate uninstall-audit
+adputate uninstall --yes
+adputate uninstall-audit
 ```
 
-The uninstall restores DNS previously changed by `dns-enable`, removes both launchd jobs, removes the Application Firewall entry, deletes the container, volumes, runtime files, logs, and Adputate-used image cache. It does not remove the source checkout or Apple's Container installation. Use `--keep-images` only when retaining the cache is intentional.
+The uninstall restores DNS previously changed by `client dns apply`, removes both launchd jobs, removes the Application Firewall entry, and deletes the container, volumes, runtime files, and logs. It removes only container images that Adputate recorded pulling itself; pre-existing shared cache entries are preserved. It does not remove the installed executable or Apple's Container installation. Use `--keep-images` to retain even Adputate-pulled images.
 
 ## Recover a stopped or unhealthy backend
 
 ```bash
-bin/adputate status
-bin/adputate doctor
-bin/adputate health
-bin/adputate restart
-bin/adputate health
+adputate host status
+adputate host doctor
+adputate host health
+adputate host restart
+adputate host health
 ```
 
-If `status` reports configuration drift, review it and use `bin/adputate reconcile --yes`. Reconciliation preserves named volumes.
+If `host status` reports configuration drift, review it and use `adputate host reconcile --yes`. Reconciliation preserves named volumes.
 
 ## Recover an image upgrade
 
-`upgrade` exports a Teleporter archive before changing images. If the new image fails readiness, Adputate restores the previous image setting and recreates the prior container while preserving named volumes. Backups are stored under `~/Library/Application Support/Adputate/teleporter`.
+`adputate host upgrade` exports a Teleporter archive before changing images. If the new image fails readiness, Adputate restores the previous image setting and recreates the prior container while preserving named volumes. Backups are stored under `~/Library/Application Support/Adputate/teleporter`.
 
 ## Emergency network recovery
 

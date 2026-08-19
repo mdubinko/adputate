@@ -16,3 +16,4 @@ tmp/
 # Keep real service credentials out of the repository while tracking examples.
 containers/*.env
 !containers/*.env.example
+build/

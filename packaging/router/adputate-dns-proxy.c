@@ -99,8 +99,10 @@ static void *forward_udp(void *context) {
   int upstream = socket(AF_INET, SOCK_DGRAM, 0);
   if (upstream >= 0) {
     set_timeouts(upstream);
-    if (sendto(upstream, job->packet, job->packet_length, 0,
-               (struct sockaddr *)&backend_address, sizeof(backend_address)) >= 0) {
+    if (connect(upstream, (struct sockaddr *)&backend_address,
+                sizeof(backend_address)) != 0) {
+      perror("UDP connect backend");
+    } else if (send(upstream, job->packet, job->packet_length, 0) >= 0) {
       ssize_t length = recv(upstream, response, sizeof(response), 0);
       if (length > 0 && response_matches(job->packet, job->packet_length,
                                          response, (size_t)length)) {
@@ -113,7 +115,7 @@ static void *forward_udp(void *context) {
         fprintf(stderr, "UDP backend returned an invalid response\n");
       }
     } else {
-      perror("UDP sendto backend");
+      perror("UDP send backend");
     }
     close(upstream);
   } else {
