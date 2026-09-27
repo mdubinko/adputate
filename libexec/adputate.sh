@@ -87,6 +87,7 @@ NETWORKSETUP_BIN="${ADPUTATE_NETWORKSETUP_BIN:-/usr/sbin/networksetup}"
 ROUTE_BIN="${ADPUTATE_ROUTE_BIN:-/sbin/route}"
 IPCONFIG_BIN="${ADPUTATE_IPCONFIG_BIN:-/usr/sbin/ipconfig}"
 DIG_BIN="${ADPUTATE_DIG_BIN:-/usr/bin/dig}"
+DSCACHEUTIL_BIN="${ADPUTATE_DSCACHEUTIL_BIN:-/usr/bin/dscacheutil}"
 SUDO_BIN="${ADPUTATE_SUDO_BIN:-/usr/bin/sudo}"
 PBCOPY_BIN="${ADPUTATE_PBCOPY_BIN:-/usr/bin/pbcopy}"
 OPEN_BIN="${ADPUTATE_OPEN_BIN:-/usr/bin/open}"
@@ -113,7 +114,9 @@ Controller commands (work from any Mac with Adputate and its configuration):
               Read or change blocking state on every active Pi-hole instance.
   bugreport [--open]
               Save and copy a sanitized diagnostic report; optionally open the issue form.
-  install     Configure existing Pi-holes and optionally prepare a local Pi-hole host.
+  install     Choose local protection or configure existing Pi-holes.
+  install --local --yes [--service NAME]
+              Start a local Pi-hole, connect this Mac's DNS, and verify the path.
   client dns status|plan|apply --yes|restore --yes
               Manage this Mac's DNS using the active Pi-hole endpoints.
   uninstall --yes [--keep-images]
@@ -1564,7 +1567,9 @@ require_router_config() {
   local helper
   helper="$(router_helper)"
   [[ -x "$helper" ]] || die "Router helper not found or not executable: $helper"
-  [[ "$HOST_BIND_ADDRESS" != "127.0.0.1" ]] || die "Configure an active LAN bind address first"
+  if [[ "$HOST_BIND_ADDRESS" == "127.0.0.1" ]]; then
+    ROUTER_INTERFACE=lo0
+  fi
   valid_port "$HOST_DNS_PORT" && (( 10#$HOST_DNS_PORT >= 1024 )) || \
     die "Configure an unprivileged DNS backend port first"
   [[ -n "$ROUTER_INTERFACE" ]] || die "Configure a LAN interface first"
@@ -1575,7 +1580,7 @@ router_preflight() {
   privacy_preflight || die "DNS privacy preflight failed"
   require_router_config
   helper="$(router_helper)"
-  /usr/bin/sudo "$helper" preflight "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
+  "$SUDO_BIN" "$helper" preflight "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
 }
 
 router_install() {
@@ -1585,10 +1590,10 @@ router_install() {
   helper="$(router_helper)"
   backend_ready || die "Pi-hole backend is not healthy; run: $CLI_NAME host health"
   printf 'Installing a root LaunchDaemon for the native port-53 frontend.\n'
-  /usr/bin/sudo "$helper" install "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
+  "$SUDO_BIN" "$helper" install "$HOST_BIND_ADDRESS" "$HOST_DNS_PORT" "$ROUTER_INTERFACE" "$ROUTER_SERVICE_LABEL"
   if ! router_status; then
     printf 'Post-install DNS probes failed; removing the failed frontend.\n' >&2
-    /usr/bin/sudo "$helper" uninstall "" "" "" "$ROUTER_SERVICE_LABEL" || true
+    "$SUDO_BIN" "$helper" uninstall "" "" "" "$ROUTER_SERVICE_LABEL" || true
     die "Router frontend installation was rolled back"
   fi
 }
@@ -1622,7 +1627,7 @@ router_uninstall() {
   local helper
   helper="$(router_helper)"
   [[ -x "$helper" ]] || die "Router helper not found or not executable: $helper"
-  /usr/bin/sudo "$helper" uninstall "" "" "" "$ROUTER_SERVICE_LABEL"
+  "$SUDO_BIN" "$helper" uninstall "" "" "" "$ROUTER_SERVICE_LABEL"
 }
 
 client_dns_default_service() {
@@ -2914,6 +2919,10 @@ prompt_yes_no() {
 install_wizard() {
   local id name role api_url dns_endpoint default_role file
   [[ -t 0 && -t 1 ]] || die "Interactive install requires a terminal"
+  if prompt_yes_no 'Protect this Mac using a local Pi-hole (includes changing its DNS)?' yes; then
+    install_local --yes
+    return
+  fi
   ensure_cluster_config
   printf 'Adputate can manage existing Pi-holes without installing one on this Mac.\n'
   show_instances
@@ -2946,6 +2955,72 @@ install_wizard() {
     setup_workstation
   fi
 }
+
+verify_local_dns() {
+  local file="$INSTANCES_DIR/adputate.conf" probe response attempt pid watchdog
+  probe="adputate-check-$(date +%s)-$$-$RANDOM.example.com"
+  response="$(mktemp "${TMPDIR:-/tmp}/adputate-dns-check.XXXXXX")"
+  # Use the system resolver, not dig's explicit-server path. A unique name avoids cache hits.
+  "$DSCACHEUTIL_BIN" -q host -a name "$probe" >/dev/null 2>&1 &
+  pid=$!
+  ( sleep 5; kill "$pid" 2>/dev/null || true ) &
+  watchdog=$!
+  wait "$pid" 2>/dev/null || true
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  for attempt in 1 2 3 4 5; do
+    if instance_api_request "$file" GET "queries?domain=$probe&length=10" "" "$response" &&
+       "$PLUTIL_BIN" -p "$response" 2>/dev/null | grep -Fq "\"domain\" => \"$probe\""; then
+      rm -f "$response"
+      printf 'Verified: a macOS system DNS lookup reached the local Pi-hole.\n'
+      return 0
+    fi
+    sleep 1
+  done
+  rm -f "$response"
+  printf 'Could not observe the system DNS probe in Pi-hole. Check query logging and VPN or encrypted-DNS settings.\n' >&2
+  return 1
+}
+
+install_local() (
+  local service file
+  [[ "${1:-}" == "--yes" ]] || die "Usage: $CLI_NAME install --local --yes [--service NAME]"
+  shift
+  service="$(client_dns_service_from_args "$@")"
+  require_apple_silicon
+  require_container
+  privacy_preflight || die "DNS privacy preflight failed"
+  [[ "$HOST_BIND_ADDRESS" == "127.0.0.1" ]] || die "Local setup requires a localhost host configuration; existing LAN configuration was preserved"
+  [[ ! -f "$DNS_BACKUP_FILE" ]] || die "Restore the current client DNS configuration before local setup: $CLI_NAME client dns restore --yes"
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    if [[ "$(config_value "$file" ACTIVE)" == "true" &&
+          ( "$file" != "$INSTANCES_DIR/adputate.conf" || "$(config_value "$file" AUTH)" != "managed-local" ) ]]; then
+      die "Local setup requires no other active instances; existing instance configuration was preserved"
+    fi
+  done < <(instance_files)
+  file="$INSTANCES_DIR/adputate.conf"
+  [[ ! -f "$file" || "$(config_value "$file" AUTH)" == "managed-local" ]] || die "The adputate instance id is already in use"
+  init_config
+  start_pihole
+  service_install
+  router_install
+  register_host_instance adputate
+  # Any failure or interruption after this point must leave the original DNS usable.
+  trap 'result=$?; if (( result != 0 )) && [[ -f "$DNS_BACKUP_FILE" ]]; then
+    if restore_dns_backup; then rm -f "$DNS_BACKUP_FILE";
+    else printf "DNS restore failed; retry: %s client dns restore --yes\n" "$CLI_NAME" >&2; fi
+  fi' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  client_dns_apply --yes --service "$service"
+  if ! verify_local_dns; then
+    client_dns_restore --yes
+    die "Local protection was not verified. Previous DNS settings were restored; the local host remains available for diagnostics"
+  fi
+  printf 'Local DNS protection is active on %s. Other devices are unchanged.\n' "$service"
+  printf 'Restore DNS before stopping Pi-hole: %s client dns restore --yes\n' "$CLI_NAME"
+)
 
 host_setup() {
   require_apple_silicon
@@ -3054,7 +3129,10 @@ main() {
       if [[ "${1:-}" == "snapshot" ]]; then shift; collect_query_snapshot "$@"; else query_logs "$@"; fi ;;
     blocking) cluster_blocking "$@" ;;
     bugreport) bugreport "$@" ;;
-    install) install_wizard ;;
+    install)
+      if [[ "${1:-}" == "--local" ]]; then shift; install_local "$@";
+      elif (( $# == 0 )); then install_wizard;
+      else die "Usage: $CLI_NAME install [--local --yes [--service NAME]]"; fi ;;
     uninstall) controller_uninstall "$@" ;;
     uninstall-audit) controller_uninstall_audit ;;
     -V|--version|version)

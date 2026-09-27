@@ -346,7 +346,8 @@ host sync configure --yes|status|now|pause|resume|logs|remove --yes
                             Manage selective NUC-to-local policy replication
 host router install|preflight|status|uninstall
                             Manage the native port-53 frontend
-install                     Configure existing nodes; optionally prepare this Mac as a host
+install                     Choose local protection or configure existing nodes
+install --local --yes        Start and verify local DNS protection on this Mac
 client dns status|plan      Show the selected service and proposed DNS endpoints
 client dns apply --yes      Back up and apply the active Pi-hole endpoint set
 client dns restore --yes    Restore the exact previous DNS/DHCP state
@@ -383,6 +384,14 @@ Full cleanup first performs any required host cleanup, then removes every Adputa
 Use `--keep-images` when the image cache is intentionally shared. Adputate stops Apple Container services only when it recorded that it started them and no other containers remain.
 
 Neither cleanup scope removes Apple Container itself. Router DHCP/DNS settings are external and must be restored separately. A source checkout or Homebrew package is also left in place because deleting the running program is the package manager's responsibility. After `adputate uninstall --yes` succeeds, remove a source installation with `make uninstall PREFIX="$HOME/.local"`; a future Homebrew installation should be removed with `brew uninstall adputate`. macOS may retain ordinary unified logs and a harmless historical launchd enable/disable preference; the audit reports the latter as a warning.
+
+## Local Protection Without an Existing Pi-hole
+
+Run `adputate install --local --yes` to start a localhost-only Pi-hole, install its
+port-53 frontend, and connect this Mac's DNS. Setup verifies a macOS system lookup
+in Pi-hole's query log and restores the previous DNS settings if verification
+fails. See [local protection setup and restoration](docs/local-protection.md) for
+requirements, network-service selection, and limitations.
 
 ## Selective Policy Replication
 

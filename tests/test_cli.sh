@@ -285,7 +285,7 @@ output="$($CLI help)"
 assert_contains "$output" 'configure [options]'
 assert_contains "$output" 'host router install|preflight|status|uninstall'
 assert_contains "$output" 'instance add <id>'
-assert_contains "$output" 'install     Configure existing Pi-holes'
+assert_contains "$output" 'install     Choose local protection'
 assert_contains "$output" 'upgrade <image> --yes'
 assert_contains "$output" 'uninstall --yes'
 output="$($CLI --version)"
@@ -646,4 +646,5 @@ ADPUTATE_APP_DIR="$NO_RUNTIME_APP" CONTAINER_BIN="$TEST_TMP/missing-container" \
   "$CLI" uninstall --yes >/dev/null
 [[ ! -e "$NO_RUNTIME_APP" ]] || fail 'full uninstall retained state when container CLI was absent'
 
+bash "$PROJECT_ROOT/tests/test_local_setup.sh"
 printf 'PASS: CLI, instance inventory, query snapshots, cluster status, drift, health-failure, port-conflict, clean-uninstall, privilege, and proxy-build tests\n'

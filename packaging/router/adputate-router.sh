@@ -50,7 +50,7 @@ classify_listeners() {
 
     command_lower="$(printf '%s' "$command_name" | /usr/bin/tr '[:upper:]' '[:lower:]')"
     if [[ "$command_lower" == mdnsrespo* && ( "$socket_name" == "*:53" || "$socket_name" == "0.0.0.0:53" ) ]]; then
-      printf '[PASS] Allowing the standard macOS wildcard listener; Adputate binds the exact LAN address.\n'
+      printf '[PASS] Allowing the standard macOS wildcard listener; Adputate binds the exact address.\n'
       continue
     fi
 
@@ -127,7 +127,9 @@ valid_ipv4() {
 
 validate_install_args() {
   valid_ipv4 "$bind_address" || { printf 'Invalid bind address: %s\n' "$bind_address" >&2; exit 1; }
-  [[ "$bind_address" != "127.0.0.1" ]] || { printf 'The router frontend requires a LAN address.\n' >&2; exit 1; }
+  if [[ "$bind_address" == "127.0.0.1" && "$interface" != "lo0" ]]; then
+    printf 'The localhost frontend requires lo0.\n' >&2; exit 1
+  fi
   [[ "$backend_port" =~ ^[0-9]+$ ]] && (( 10#$backend_port >= 1024 && 10#$backend_port <= 65535 )) || {
     printf 'Backend port must be between 1024 and 65535.\n' >&2; exit 1;
   }
