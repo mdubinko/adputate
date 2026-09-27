@@ -20,6 +20,8 @@ FAKE_CONTAINER="$TEST_TMP/container"
 FAKE_STATE_FILE="$TEST_TMP/container-state"
 FAKE_IMAGE_FILE="$TEST_TMP/container-images"
 FAKE_SYSTEM_STATE="$TEST_TMP/container-system-state"
+FAKE_SYNC_ENV_CAPTURE="$TEST_TMP/nebula-sync-env"
+FAKE_SYNC_CONTAINER_NAME="adputate-nebula-sync"
 printf 'missing\n' >"$FAKE_STATE_FILE"
 printf 'pihole/pihole:2026.07.2\n' >"$FAKE_IMAGE_FILE"
 printf 'running\n' >"$FAKE_SYSTEM_STATE"
@@ -71,7 +73,18 @@ JSON
       *) exit 0 ;;
     esac
     ;;
-  run) printf 'running\n' >"$FAKE_STATE_FILE" ;;
+  run)
+    if [[ " $* " == *" --name $FAKE_SYNC_CONTAINER_NAME "* ]]; then
+      args=("$@")
+      for ((i=0; i<${#args[@]}; i++)); do
+        if [[ "${args[$i]}" == "--env-file" ]]; then cp "${args[$((i + 1))]}" "$FAKE_SYNC_ENV_CAPTURE"; fi
+      done
+      printf 'test selective sync completed\n'
+      [[ "${FAKE_SYNC_FAIL:-0}" != "1" ]]
+    else
+      printf 'running\n' >"$FAKE_STATE_FILE"
+    fi
+    ;;
   start) printf 'running\n' >"$FAKE_STATE_FILE" ;;
   stop) printf 'stopped\n' >"$FAKE_STATE_FILE" ;;
   delete) printf 'missing\n' >"$FAKE_STATE_FILE" ;;
@@ -107,6 +120,22 @@ elif [[ "$url" == *'/api/queries?'* ]]; then
   printf '{"queries":[{"id":1,"time":1,"domain":"blocked.example","status":"GRAVITY","client":{"ip":"192.0.2.2"}}]}\n' >"$output"
 elif [[ "$url" == */api/dns/blocking ]]; then
   printf '{"blocking":"enabled","timer":null}\n' >"$output"
+elif [[ "$url" == */api/groups ]]; then
+  if [[ "$url" == http://192.0.2.53/* ]]; then group_id=7; else group_id=0; fi
+  printf '{"groups":[{"id":%s,"name":"Default","enabled":true,"comment":"The default group","date_added":1,"date_modified":2}]}\n' \
+    "$group_id" >"$output"
+elif [[ "$url" == */api/lists ]]; then
+  if [[ "$url" == http://192.0.2.53/* ]]; then group_id=7; else group_id=0; fi
+  address='https://example.test/blocklist.txt'
+  if [[ "${FAKE_POLICY_DRIFT:-0}" == "1" && "$url" != http://192.0.2.53/* ]]; then
+    address='https://example.test/drifted.txt'
+  fi
+  printf '{"lists":[{"id":1,"address":"%s","type":"block","enabled":true,"comment":"Test list","groups":[%s],"date_added":1,"date_modified":2,"date_updated":3,"number":4,"invalid_domains":0,"status":1,"abp_entries":0}]}\n' \
+    "$address" "$group_id" >"$output"
+elif [[ "$url" == */api/domains ]]; then
+  if [[ "$url" == http://192.0.2.53/* ]]; then group_id=7; else group_id=0; fi
+  printf '{"domains":[{"id":1,"domain":"blocked.example","type":"deny","kind":"exact","enabled":true,"comment":"Test domain","groups":[%s],"date_added":1,"date_modified":2}]}\n' \
+    "$group_id" >"$output"
 else
   [[ -n "$output" ]] && printf '{}\n' >"$output"
 fi
@@ -248,6 +277,7 @@ export ADPUTATE_OPEN_BIN="$FAKE_OPEN"
 export ADPUTATE_ISSUES_URL="https://example.invalid/adputate/issues/new"
 export FAKE_DNS_STATE
 export FAKE_STATE_FILE FAKE_IMAGE_FILE FAKE_SYSTEM_STATE FAKE_KEYCHAIN_STATE FAKE_CLIPBOARD FAKE_OPEN_STATE
+export FAKE_SYNC_ENV_CAPTURE FAKE_SYNC_CONTAINER_NAME
 export FAKE_CONTAINER_NAME="$ADPUTATE_CONTAINER_NAME"
 mkdir -p "$HOME/Library/Application Support"
 
@@ -429,8 +459,8 @@ output="$($CLI status)"
 assert_contains "$output" 'API: reachable'
 assert_contains "$output" 'Blocking: enabled'
 
-$CLI instance add nuc --name 'NUC Pi-hole' --role authority \
-  --api-url http://192.0.2.53 --dns 192.0.2.53#53 --no-auth >/dev/null
+printf 'nuc-secret\n' | $CLI instance add nuc --name 'NUC Pi-hole' --role authority \
+  --api-url http://192.0.2.53 --dns 192.0.2.53#53 --password-stdin >/dev/null
 output="$($CLI instance list)"
 assert_contains "$output" 'Instance: nuc'
 assert_contains "$output" 'Name:      NUC Pi-hole'
@@ -447,6 +477,48 @@ $CLI client dns apply --yes >/dev/null
 [[ "$(sed -n '2p' "$FAKE_DNS_STATE")" == "127.0.0.1" ]] || fail 'replica was not second in client DNS'
 $CLI client dns restore --yes >/dev/null
 [[ "$(cat "$FAKE_DNS_STATE")" == "192.168.86.1" ]] || fail 'client DNS restore did not recover prior DNS'
+printf 'running\n' >"$FAKE_STATE_FILE"
+output="$($CLI host sync configure --yes --interval 5m --stale-after 15m)"
+assert_contains "$output" 'schedule is paused and no policy was copied'
+output="$($CLI host sync status)"
+assert_contains "$output" 'Direction:    nuc -> adputate'
+assert_contains "$output" 'paused=true'
+output="$($CLI host sync now)"
+assert_contains "$output" 'completed successfully'
+assert_contains "$(cat "$FAKE_SYNC_ENV_CAPTURE")" 'PRIMARY=http://192.0.2.53|nuc-secret'
+assert_contains "$(cat "$FAKE_SYNC_ENV_CAPTURE")" 'FULL_SYNC=false'
+assert_contains "$(cat "$FAKE_SYNC_ENV_CAPTURE")" 'SYNC_GRAVITY_DOMAIN_LIST_BY_GROUP=true'
+assert_contains "$(cat "$FAKE_SYNC_ENV_CAPTURE")" 'SYNC_GRAVITY_CLIENT=false'
+output="$($CLI host sync verify)"
+assert_contains "$output" '[PASS] Groups: 1 record(s) match'
+assert_contains "$output" '[PASS] Adlists: 1 record(s) match'
+assert_contains "$output" '[PASS] Domains: 1 record(s) match'
+assert_contains "$output" '[PASS] Mappings: 2 record(s) match'
+assert_contains "$output" 'No Pi-hole state was changed'
+if FAKE_POLICY_DRIFT=1 $CLI host sync verify >"$TEST_TMP/sync-verify-drift.out" 2>&1; then
+  fail 'sync verify succeeded when policies differed'
+fi
+assert_contains "$(cat "$TEST_TMP/sync-verify-drift.out")" '[FAIL] Adlists differ'
+assert_contains "$(cat "$TEST_TMP/sync-verify-drift.out")" '[FAIL] Mappings differ'
+if find "$ADPUTATE_APP_DIR/data" -name 'nebula-sync-env.*' -print -quit | grep -q .; then
+  fail 'Nebula Sync runtime credential file was retained'
+fi
+if FAKE_SYNC_FAIL=1 $CLI host sync now >"$TEST_TMP/sync-failure.out" 2>&1; then
+  fail 'sync now reported success when the Nebula Sync container failed'
+fi
+assert_contains "$($CLI host sync status)" 'Last result:  failed'
+assert_contains "$(cat "$TEST_TMP/sync-failure.out")" 'Nebula Sync failed'
+$CLI host sync resume >/dev/null
+assert_contains "$($CLI host sync status)" 'paused=false'
+sed -i '' 's/^LAST_ATTEMPT_EPOCH=.*/LAST_ATTEMPT_EPOCH=0/' "$ADPUTATE_APP_DIR/data/nebula-sync-state.conf"
+$CLI host ensure >/dev/null
+assert_contains "$($CLI host sync status)" 'Last result:  success'
+$CLI host sync pause >/dev/null
+assert_contains "$($CLI host sync status)" 'paused=true'
+assert_contains "$($CLI host sync logs)" 'test selective sync completed'
+$CLI host sync remove --yes >/dev/null
+[[ ! -e "$ADPUTATE_APP_DIR/config/nebula-sync.conf" ]] || fail 'sync remove retained configuration'
+printf 'missing\n' >"$FAKE_STATE_FILE"
 rm -f "$ADPUTATE_ROUTER_PLIST_PATH"
 $CLI instance remove nuc >/dev/null
 [[ ! -e "$ADPUTATE_APP_DIR/config/instances.d/nuc.conf" ]] || fail 'instance-remove retained peer metadata'

@@ -342,6 +342,8 @@ host configure [options]    Persist the local container configuration
 host register [id]          Explicitly register this host as a replica
 host service install|uninstall|enable|disable|kick|status|plist
                             Manage login startup and periodic recovery
+host sync configure --yes|status|now|pause|resume|logs|remove --yes
+                            Manage selective NUC-to-local policy replication
 host router install|preflight|status|uninstall
                             Manage the native port-53 frontend
 install                     Configure existing nodes; optionally prepare this Mac as a host
@@ -382,6 +384,28 @@ Use `--keep-images` when the image cache is intentionally shared. Adputate stops
 
 Neither cleanup scope removes Apple Container itself. Router DHCP/DNS settings are external and must be restored separately. A source checkout or Homebrew package is also left in place because deleting the running program is the package manager's responsibility. After `adputate uninstall --yes` succeeds, remove a source installation with `make uninstall PREFIX="$HOME/.local"`; a future Homebrew installation should be removed with `brew uninstall adputate`. macOS may retain ordinary unified logs and a harmless historical launchd enable/disable preference; the audit reports the latter as a warning.
 
+## Selective Policy Replication
+
+The first Nebula Sync lifecycle is implemented for the primary deployment: exactly one active remote authority, such as the NUC, and exactly one active Adputate-managed local replica. It uses the pinned `ghcr.io/lovelaze/nebula-sync:v0.11.2` image and selective one-way synchronization. Groups, adlists, domain allow/deny entries, and their group mappings are copied from the authority. DNS listeners, upstreams, web settings, credentials, DHCP, NTP, database/privacy settings, blocking state, clients, and client mappings remain node-local.
+
+Configure it on the always-on Mac that hosts the replica:
+
+```bash
+adputate host sync configure --yes
+adputate host sync status
+adputate host sync now
+# Read both Pi-holes and compare groups, adlists, domains, and group mappings.
+# This does not change either Pi-hole.
+adputate host sync verify
+adputate host sync resume
+```
+
+Configuration starts paused and the first command copies no policy. `sync now` is the explicit first synchronization; `sync resume` enables the five-minute default schedule. The existing login recovery LaunchAgent checks whether a run is due every minute, catches up after downtime, and prevents overlapping runs. `pause`, `logs`, and `remove --yes` complete the lifecycle. State and bounded logs identify the last attempt, last success, duration, and freshness.
+
+Passwords are read from Keychain and the managed local Pi-hole environment only when a run begins. Adputate writes them to a mode-0600 temporary environment file, supplies that file to an ephemeral read-only Nebula Sync container, and removes it when the run exits. The generated environment uses `FULL_SYNC=false`; continuous/full Teleporter synchronization is deliberately prohibited because it could overwrite node-local settings. Nebula Sync requires elevated application-password API permission on replicas, so configuration explicitly enables Pi-hole's `webserver.api.app_sudo` on the managed local replica.
+
+Scheduled operation does not require SSH. Manual sync lifecycle commands currently run on the Mac Studio itself, so invoking `sync now` or reading its local state from a controller-only laptop still requires an SSH session. Top-level status, query, blocking, and client-DNS commands remain controller operations and do not require SSH.
+
 ## Current Limitations
 
 - The recovery LaunchAgent runs after its operator logs in; it is not an independent pre-login boot service.
@@ -390,6 +414,8 @@ Neither cleanup scope removes Apple Container itself. Router DHCP/DNS settings a
 - A cluster-wide blocking change preflights every active node and verifies the result, but it cannot be atomic if a node fails during the operation.
 - Remote Pi-hole application/API passwords are stored in Keychain, but there is not yet a credential-rotation command. Replacing a remote password currently requires removing and recreating its endpoint registration. The generated password for a Pi-hole hosted on this Mac is a separate credential exposed by `adputate host password`.
 - Query snapshots are limited to 10,000 records per Pi-hole request and are not paginated yet.
+- Nebula Sync is pinned to a release tag but not yet to an immutable image digest, and real two-machine policy-convergence testing remains outstanding.
+- Nebula Sync currently supports one remote authority and one managed-local replica; manual lifecycle control is host-local.
 - The physical-client, reboot, sleep/wake, DHCP-address-change, and deliberate failure tests listed below remain release gates.
 
 ## Milestone 0: Dependable Standalone Server
@@ -402,7 +428,7 @@ The standalone server path is implemented. Before calling Milestone 0 production
 - A numbered, checksummed release and Homebrew tap
 - Signed and notarized packaging
 
-After that milestone, planned work includes optional [Nebula Sync](https://github.com/lovelaze/nebula-sync) integration, primary-to-replica synchronization, drift detection, and health-aware failover. The dedicated Pi-hole should remain authoritative by default.
+Milestone 1 now includes an experimental, selectively allowlisted [Nebula Sync](https://github.com/lovelaze/nebula-sync) lifecycle. Immutable digest pinning, real primary-to-replica convergence testing, richer drift reporting, and health-aware failover remain. The dedicated Pi-hole stays authoritative by default.
 
 ## Project Layout
 
@@ -429,7 +455,7 @@ Adputate builds on:
 - [Pi-hole](https://pi-hole.net/) and its [official container image](https://github.com/pi-hole/docker-pi-hole)
 - [Apple Container](https://github.com/apple/container)
 - [DesktopECHO/PiCon](https://github.com/DesktopECHO/PiCon), which demonstrated the practicality of a self-contained Pi-hole appliance on macOS
-- [Nebula Sync](https://github.com/lovelaze/nebula-sync) for the planned Pi-hole v6 synchronization path
+- [Nebula Sync](https://github.com/lovelaze/nebula-sync) for selective Pi-hole v6 policy synchronization
 
 Adputate is not affiliated with or endorsed by Pi-hole, Apple, PiCon, or Nebula Sync.
 

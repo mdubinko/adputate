@@ -30,3 +30,7 @@ etc_dnsmasq = "adputate-etc-dnsmasq.d"
 image = "ghcr.io/lovelaze/nebula-sync:v0.11.2"
 env_example = "containers/nebula-sync.env.example"
 mode = "primary-to-local-replica"
+lifecycle = "ephemeral-one-shot"
+profile = "groups-adlists-domains"
+default_interval_seconds = 300
+initially_paused = true

@@ -73,6 +73,12 @@ CLUSTER_CONFIG_FILE="$CONFIG_DIR/cluster.conf"
 INSTANCES_DIR="$CONFIG_DIR/instances.d"
 QUERY_SNAPSHOT_ROOT="$APP_DIR/query-snapshots"
 KEYCHAIN_SERVICE="${ADPUTATE_KEYCHAIN_SERVICE:-com.${CLI_NAME}.pihole.instance}"
+SYNC_CONFIG_FILE="$CONFIG_DIR/nebula-sync.conf"
+SYNC_STATE_FILE="$DATA_DIR/nebula-sync-state.conf"
+SYNC_LOCK_DIR="$DATA_DIR/nebula-sync.lock"
+SYNC_LOG_FILE="$LOG_DIR/nebula-sync.log"
+SYNC_CONTAINER_NAME="${ADPUTATE_SYNC_CONTAINER_NAME:-${CLI_NAME}-nebula-sync}"
+DEFAULT_SYNC_IMAGE="ghcr.io/lovelaze/nebula-sync:v0.11.2"
 CURL_BIN="${ADPUTATE_CURL_BIN:-/usr/bin/curl}"
 SECURITY_BIN="${ADPUTATE_SECURITY_BIN:-/usr/bin/security}"
 PLUTIL_BIN="${ADPUTATE_PLUTIL_BIN:-/usr/bin/plutil}"
@@ -124,6 +130,7 @@ Host commands (run on the always-on Mac Studio that hosts Adputate):
   host password
   host service install|uninstall|enable|disable|kick|status|plist
   host router install|preflight|status|uninstall
+  host sync configure --yes|status|now|verify|pause|resume|logs|remove --yes
   host teleporter export [directory]|import <zip>
   host upgrade <image> --yes|reset
   host uninstall --yes [--keep-images]|uninstall-audit
@@ -669,37 +676,53 @@ instance_password() {
   esac
 }
 
-instance_api_request() {
-  local file="$1" method="$2" endpoint="$3" payload="$4" output="$5"
-  local id api_url password temporary auth_payload auth_response request_payload sid curl_config result=0
+instance_api_session_open() {
+  local file="$1" temporary="$2" curl_config="$3"
+  local id api_url password auth_payload auth_response sid
   id="$(config_value "$file" ID)"
   api_url="$(config_value "$file" API_URL)"
   password="$(instance_password "$file")" || return 1
-  temporary="$(mktemp -d "${TMPDIR:-/tmp}/adputate-api.XXXXXX")"
-  chmod 700 "$temporary"
   auth_payload="$temporary/auth.json"
   auth_response="$temporary/auth-response.json"
-  request_payload="$temporary/request.json"
-  curl_config="$temporary/curl.conf"
   if [[ -n "$password" ]]; then
     printf '{"password":"%s"}\n' "$(json_escape "$password")" >"$auth_payload"
     chmod 600 "$auth_payload"
     if ! "$CURL_BIN" --silent --show-error --fail-with-body --connect-timeout 5 --max-time 15 \
       --request POST --header 'Content-Type: application/json' --data-binary "@$auth_payload" \
       --output "$auth_response" "$api_url/api/auth"; then
-      rm -rf -- "$temporary"
       return 1
     fi
     sid="$("$PLUTIL_BIN" -extract session.sid raw -o - "$auth_response" 2>/dev/null || true)"
     [[ -n "$sid" && ${#sid} -le 256 && "$sid" =~ ^[A-Za-z0-9+/=_-]+$ ]] || {
       printf 'Pi-hole %s returned an invalid session identifier.\n' "$id" >&2
-      rm -rf -- "$temporary"
       return 1
     }
     printf 'header = "X-FTL-SID: %s"\n' "$sid" >"$curl_config"
     chmod 600 "$curl_config"
   else
     : >"$curl_config"
+  fi
+}
+
+instance_api_session_close() {
+  local file="$1" curl_config="$2" api_url
+  [[ -s "$curl_config" ]] || return 0
+  api_url="$(config_value "$file" API_URL)"
+  "$CURL_BIN" --config "$curl_config" --silent --show-error --max-time 10 \
+    --request DELETE "$api_url/api/auth" >/dev/null 2>&1 || true
+}
+
+instance_api_request() {
+  local file="$1" method="$2" endpoint="$3" payload="$4" output="$5"
+  local api_url temporary request_payload curl_config result=0
+  api_url="$(config_value "$file" API_URL)"
+  temporary="$(mktemp -d "${TMPDIR:-/tmp}/adputate-api.XXXXXX")"
+  chmod 700 "$temporary"
+  request_payload="$temporary/request.json"
+  curl_config="$temporary/curl.conf"
+  if ! instance_api_session_open "$file" "$temporary" "$curl_config"; then
+    rm -rf -- "$temporary"
+    return 1
   fi
   if [[ -n "$payload" ]]; then
     printf '%s\n' "$payload" >"$request_payload"
@@ -713,10 +736,7 @@ instance_api_request() {
       --connect-timeout 5 --max-time 30 --request "$method" \
       --output "$output" "$api_url/api/$endpoint" || result=1
   fi
-  if [[ -n "${sid:-}" ]]; then
-    "$CURL_BIN" --config "$curl_config" --silent --show-error --max-time 10 \
-      --request DELETE "$api_url/api/auth" >/dev/null 2>&1 || true
-  fi
+  instance_api_session_close "$file" "$curl_config"
   rm -rf -- "$temporary"
   return "$result"
 }
@@ -1161,6 +1181,7 @@ TZ=$(detect_timezone)
 FTLCONF_webserver_api_password=$password
 FTLCONF_dns_listeningMode=ALL
 FTLCONF_dns_upstreams=$PIHOLE_UPSTREAMS
+FTLCONF_webserver_api_app_sudo=true
 EOF
     chmod 600 "$ENV_FILE"
   else
@@ -1881,6 +1902,7 @@ ensure_pihole() {
   # launchd calls this periodically. start_pihole is intentionally idempotent and
   # restores both the user-scoped Apple Container runtime and the Pi-hole container.
   start_pihole
+  sync_ensure
 }
 
 reconcile_container() {
@@ -2071,6 +2093,432 @@ upgrade_pihole() {
   die "Upgrade failed and the previous image was restored; backup is in $backup_dir"
 }
 
+sync_topology() {
+  local file role active auth authority_file="" replica_file="" authority_count=0 replica_count=0
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    active="$(config_value "$file" ACTIVE)"
+    [[ "$active" == "true" ]] || continue
+    role="$(config_value "$file" ROLE)"
+    auth="$(config_value "$file" AUTH)"
+    if [[ "$role" == "authority" ]]; then
+      authority_file="$file"; authority_count=$((authority_count + 1))
+    elif [[ "$role" == "replica" && "$auth" == "managed-local" ]]; then
+      replica_file="$file"; replica_count=$((replica_count + 1))
+    fi
+  done < <(instance_files)
+  (( authority_count == 1 )) || die "Nebula Sync requires exactly one active authority; found $authority_count"
+  (( replica_count == 1 )) || die "Nebula Sync currently requires exactly one active managed-local replica; found $replica_count"
+  printf '%s\n%s\n' "$authority_file" "$replica_file"
+}
+
+write_sync_config() {
+  local image="$1" interval="$2" stale_after="$3" paused="$4" authority_id="$5" replica_id="$6" temporary
+  ensure_dirs
+  temporary="$(mktemp "$CONFIG_DIR/nebula-sync.conf.XXXXXX")"
+  chmod 600 "$temporary"
+  {
+    printf '# Non-secret selective Nebula Sync configuration.\n'
+    printf 'IMAGE=%s\nINTERVAL_SECONDS=%s\nSTALE_AFTER_SECONDS=%s\n' "$image" "$interval" "$stale_after"
+    printf 'PAUSED=%s\nAUTHORITY_ID=%s\nREPLICA_ID=%s\n' "$paused" "$authority_id" "$replica_id"
+    printf 'PROFILE=groups-adlists-domains\n'
+  } >"$temporary"
+  mv "$temporary" "$SYNC_CONFIG_FILE"
+}
+
+write_sync_state() {
+  local result="$1" attempt="$2" success="$3" duration="$4" temporary
+  ensure_dirs
+  temporary="$(mktemp "$DATA_DIR/nebula-sync-state.conf.XXXXXX")"
+  chmod 600 "$temporary"
+  {
+    printf '# Nebula Sync run state; contains no credentials.\n'
+    printf 'LAST_RESULT=%s\nLAST_ATTEMPT_EPOCH=%s\n' "$result" "$attempt"
+    printf 'LAST_SUCCESS_EPOCH=%s\nLAST_DURATION_SECONDS=%s\n' "$success" "$duration"
+  } >"$temporary"
+  mv "$temporary" "$SYNC_STATE_FILE"
+}
+
+sync_state_value() {
+  [[ -f "$SYNC_STATE_FILE" ]] || return 0
+  config_value "$SYNC_STATE_FILE" "$1"
+}
+
+sync_configure() {
+  local confirmed=0 interval_text="5m" stale_text="15m" image="$DEFAULT_SYNC_IMAGE"
+  local interval stale_after topology authority_file replica_file authority_id replica_id argument
+  while (( $# > 0 )); do
+    argument="$1"
+    case "$argument" in
+      --yes) confirmed=1; shift ;;
+      --interval) (( $# >= 2 )) || die "--interval requires a duration"; interval_text="$2"; shift 2 ;;
+      --stale-after) (( $# >= 2 )) || die "--stale-after requires a duration"; stale_text="$2"; shift 2 ;;
+      --image) (( $# >= 2 )) || die "--image requires a pinned image"; image="$2"; shift 2 ;;
+      *) die "Unknown sync configure option: $argument" ;;
+    esac
+  done
+  (( confirmed == 1 )) || die "Refusing to configure policy replication without --yes"
+  interval="$(duration_seconds "$interval_text")" || die "Sync interval must look like 5m or 1h"
+  stale_after="$(duration_seconds "$stale_text")" || die "Staleness threshold must look like 15m or 1h"
+  (( stale_after >= interval )) || die "Staleness threshold must be at least the sync interval"
+  image_is_pinned "$image" || die "Nebula Sync image must use a pinned tag, not latest"
+  require_container
+  container_running || die "$CONTAINER_NAME must be running before configuring synchronization"
+  topology="$(sync_topology)"
+  authority_file="$(printf '%s\n' "$topology" | sed -n '1p')"
+  replica_file="$(printf '%s\n' "$topology" | sed -n '2p')"
+  authority_id="$(config_value "$authority_file" ID)"
+  replica_id="$(config_value "$replica_file" ID)"
+  [[ -n "$(instance_password "$authority_file")" ]] || die "Authority $authority_id requires an application password"
+  [[ -n "$(instance_password "$replica_file")" ]] || die "Replica $replica_id requires an API password"
+  "$CONTAINER_BIN" exec "$CONTAINER_NAME" pihole-FTL --config webserver.api.app_sudo true >/dev/null
+  write_sync_config "$image" "$interval" "$stale_after" true "$authority_id" "$replica_id"
+  printf 'Configured selective Nebula Sync: %s -> %s every %s.\n' "$authority_id" "$replica_id" "$interval_text"
+  printf 'The schedule is paused and no policy was copied. Review, run `%s host sync now`, then `%s host sync resume`.\n' "$CLI_NAME" "$CLI_NAME"
+}
+
+sync_runtime_env() {
+  local destination="$1" topology authority_file replica_file authority_url replica_url authority_password replica_password
+  local authority_id replica_id expected_authority expected_replica
+  topology="$(sync_topology)"
+  authority_file="$(printf '%s\n' "$topology" | sed -n '1p')"
+  replica_file="$(printf '%s\n' "$topology" | sed -n '2p')"
+  authority_url="$(config_value "$authority_file" API_URL)"
+  replica_url="$(config_value "$replica_file" API_URL)"
+  authority_id="$(config_value "$authority_file" ID)"
+  replica_id="$(config_value "$replica_file" ID)"
+  expected_authority="$(config_value "$SYNC_CONFIG_FILE" AUTHORITY_ID)"
+  expected_replica="$(config_value "$SYNC_CONFIG_FILE" REPLICA_ID)"
+  [[ "$authority_id" == "$expected_authority" && "$replica_id" == "$expected_replica" ]] ||
+    die "Sync topology drifted from $expected_authority -> $expected_replica; reconfigure explicitly"
+  authority_password="$(instance_password "$authority_file")"
+  replica_password="$(instance_password "$replica_file")"
+  [[ -n "$authority_password" && -n "$replica_password" ]] || die "Both sync endpoints require passwords"
+  [[ "$authority_password" != *['|,']* && "$replica_password" != *['|,']* ]] ||
+    die "Nebula Sync passwords may not contain pipe or comma characters"
+  {
+    printf 'PRIMARY=%s|%s\nREPLICAS=%s|%s\n' "$authority_url" "$authority_password" "$replica_url" "$replica_password"
+    printf 'FULL_SYNC=false\nRUN_GRAVITY=true\n'
+    printf 'SYNC_GRAVITY_GROUP=true\nSYNC_GRAVITY_AD_LIST=true\nSYNC_GRAVITY_AD_LIST_BY_GROUP=true\n'
+    printf 'SYNC_GRAVITY_DOMAIN_LIST=true\nSYNC_GRAVITY_DOMAIN_LIST_BY_GROUP=true\n'
+    printf 'SYNC_GRAVITY_CLIENT=false\nSYNC_GRAVITY_CLIENT_BY_GROUP=false\n'
+    printf 'CLIENT_TIMEOUT_SECONDS=20\nCLIENT_RETRY_DELAY_SECONDS=2\nTZ=%s\n' "$(detect_timezone)"
+  } >"$destination"
+  chmod 600 "$destination"
+}
+
+named_container_exists() {
+  "$CONTAINER_BIN" list --all --quiet 2>/dev/null | grep -Fxq "$1"
+}
+
+named_container_running() {
+  "$CONTAINER_BIN" list --quiet 2>/dev/null | grep -Fxq "$1"
+}
+
+sync_trim_log() {
+  local temporary
+  [[ -f "$SYNC_LOG_FILE" ]] || return
+  temporary="$(mktemp "$LOG_DIR/nebula-sync.log.XXXXXX")"
+  tail -1000 "$SYNC_LOG_FILE" >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$SYNC_LOG_FILE"
+}
+
+sync_now() (
+  local scheduled=0 image env_file started finished duration result=failed previous_success="" lock_mtime now
+  [[ "${1:-}" != "--scheduled" ]] || scheduled=1
+  [[ -f "$SYNC_CONFIG_FILE" ]] || die "Nebula Sync is not configured. Run: $CLI_NAME host sync configure --yes"
+  ensure_dirs
+  now="$(date +%s)"
+  if [[ -d "$SYNC_LOCK_DIR" ]]; then
+    lock_mtime="$(/usr/bin/stat -f %m "$SYNC_LOCK_DIR" 2>/dev/null || printf '0')"
+    if (( now - lock_mtime > 3600 )); then
+      rmdir "$SYNC_LOCK_DIR" 2>/dev/null || die "A stale Nebula Sync lock could not be cleared"
+    fi
+  fi
+  mkdir "$SYNC_LOCK_DIR" 2>/dev/null || die "A Nebula Sync run is already in progress"
+  local stale_env
+  for stale_env in "$DATA_DIR"/nebula-sync-env.*; do
+    [[ -f "$stale_env" ]] && rm -f -- "$stale_env"
+  done
+  env_file="$(mktemp "$DATA_DIR/nebula-sync-env.XXXXXX")"
+  trap 'rm -f -- "$env_file"; rmdir "$SYNC_LOCK_DIR" 2>/dev/null || true' EXIT
+  trap 'exit 130' HUP INT TERM
+  sync_runtime_env "$env_file"
+  image="$(config_value "$SYNC_CONFIG_FILE" IMAGE)"
+  image_is_pinned "$image" || die "Configured Nebula Sync image is not pinned"
+  require_container
+  start_container_system
+  container_running || die "$CONTAINER_NAME must be running before synchronization"
+  if ! image_exists "$image"; then
+    record_owned_image_if_missing "$image"
+    "$CONTAINER_BIN" image pull --platform linux/arm64 "$image"
+  fi
+  previous_success="$(sync_state_value LAST_SUCCESS_EPOCH)"
+  started="$(date +%s)"
+  printf '\n[%s] selective sync started (%s)\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$image" >>"$SYNC_LOG_FILE"
+  chmod 600 "$SYNC_LOG_FILE"
+  if "$CONTAINER_BIN" run --rm --name "$SYNC_CONTAINER_NAME" --platform linux/arm64 \
+      --cpus 1 --memory 256M --read-only --tmpfs /tmp --user 0 \
+      --env-file "$env_file" "$image" >>"$SYNC_LOG_FILE" 2>&1; then
+    result=success
+  fi
+  finished="$(date +%s)"
+  duration="$((finished - started))"
+  if [[ "$result" == "success" ]]; then
+    write_sync_state success "$finished" "$finished" "$duration"
+    printf 'Nebula Sync completed successfully in %ss.\n' "$duration"
+  else
+    write_sync_state failed "$finished" "$previous_success" "$duration"
+    printf 'Nebula Sync failed after %ss. Review: %s\n' "$duration" "$SYNC_LOG_FILE" >&2
+  fi
+  sync_trim_log
+  [[ "$result" == "success" ]] || (( scheduled == 1 ))
+)
+
+sync_due() {
+  local now interval last_attempt paused
+  [[ -f "$SYNC_CONFIG_FILE" ]] || return 1
+  paused="$(config_value "$SYNC_CONFIG_FILE" PAUSED)"
+  [[ "$paused" == "false" ]] || return 1
+  interval="$(config_value "$SYNC_CONFIG_FILE" INTERVAL_SECONDS)"
+  last_attempt="$(sync_state_value LAST_ATTEMPT_EPOCH)"
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$last_attempt" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  (( now - last_attempt >= interval ))
+}
+
+sync_ensure() {
+  sync_due || return 0
+  sync_now --scheduled || true
+}
+
+sync_status() {
+  local image interval stale_after paused authority replica result attempt success duration now age stale_label running_label
+  if [[ ! -f "$SYNC_CONFIG_FILE" ]]; then printf 'Nebula Sync: not configured\n'; return; fi
+  image="$(config_value "$SYNC_CONFIG_FILE" IMAGE)"
+  interval="$(config_value "$SYNC_CONFIG_FILE" INTERVAL_SECONDS)"
+  stale_after="$(config_value "$SYNC_CONFIG_FILE" STALE_AFTER_SECONDS)"
+  paused="$(config_value "$SYNC_CONFIG_FILE" PAUSED)"
+  authority="$(config_value "$SYNC_CONFIG_FILE" AUTHORITY_ID)"
+  replica="$(config_value "$SYNC_CONFIG_FILE" REPLICA_ID)"
+  result="$(sync_state_value LAST_RESULT)"
+  attempt="$(sync_state_value LAST_ATTEMPT_EPOCH)"
+  success="$(sync_state_value LAST_SUCCESS_EPOCH)"
+  duration="$(sync_state_value LAST_DURATION_SECONDS)"
+  named_container_running "$SYNC_CONTAINER_NAME" && running_label=running || running_label=idle
+  stale_label="never synchronized"
+  if [[ "$success" =~ ^[0-9]+$ ]]; then
+    now="$(date +%s)"; age="$((now - success))"
+    if (( age > stale_after )); then stale_label="stale (${age}s old)"; else stale_label="fresh (${age}s old)"; fi
+  fi
+  printf 'Nebula Sync configuration: %s\n' "$SYNC_CONFIG_FILE"
+  printf '  Direction:    %s -> %s\n' "$authority" "$replica"
+  printf '  Profile:      groups, adlists, domains, and mappings\n'
+  printf '  Image:        %s\n' "$image"
+  printf '  Schedule:     every %ss; paused=%s\n' "$interval" "$paused"
+  printf '  Runtime:      %s\n' "$running_label"
+  printf '  Last result:  %s\n' "${result:-never run}"
+  printf '  Last attempt: %s\n' "${attempt:-never}"
+  printf '  Last success: %s\n' "${success:-never}"
+  printf '  Freshness:    %s\n' "$stale_label"
+  printf '  Duration:     %s\n' "${duration:-unknown}"
+  printf '  Log:          %s\n' "$SYNC_LOG_FILE"
+}
+
+policy_value_raw() {
+  local file="$1" path="$2"
+  if "$PLUTIL_BIN" -type "$path" "$file" >/dev/null 2>&1; then
+    "$PLUTIL_BIN" -extract "$path" raw -o - "$file"
+  fi
+}
+
+policy_value_b64() {
+  local file="$1" path="$2"
+  policy_value_raw "$file" "$path" | /usr/bin/base64 | tr -d '\n'
+}
+
+policy_array_count() {
+  local file="$1" path="$2" count
+  count="$(policy_value_raw "$file" "$path")"
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$count"
+}
+
+sync_fetch_policy_responses() {
+  local instance_file="$1" destination="$2" session_dir curl_config api_url endpoint result=0
+  session_dir="$destination/session"
+  curl_config="$session_dir/curl.conf"
+  api_url="$(config_value "$instance_file" API_URL)"
+  mkdir -p "$session_dir"
+  chmod 700 "$session_dir"
+  if ! instance_api_session_open "$instance_file" "$session_dir" "$curl_config"; then
+    /bin/sleep 2
+    instance_api_session_open "$instance_file" "$session_dir" "$curl_config" || return 1
+  fi
+  for endpoint in groups lists domains; do
+    if ! "$CURL_BIN" --config "$curl_config" --silent --show-error --fail-with-body \
+      --connect-timeout 5 --max-time 30 --request GET \
+      --output "$destination/$endpoint.json" "$api_url/api/$endpoint"; then
+      result=1
+      break
+    fi
+  done
+  instance_api_session_close "$instance_file" "$curl_config"
+  rm -rf -- "$session_dir"
+  return "$result"
+}
+
+sync_policy_snapshot() {
+  local instance_file="$1" destination="$2" endpoint count index path id name enabled comment
+  local address type domain kind group_count group_index group_id group_name
+  mkdir -p "$destination/group-names"
+  : >"$destination/groups.unsorted"
+  : >"$destination/adlists.unsorted"
+  : >"$destination/domains.unsorted"
+  : >"$destination/mappings.unsorted"
+
+  sync_fetch_policy_responses "$instance_file" "$destination" || return 1
+
+  count="$(policy_array_count "$destination/groups.json" groups)" || return 1
+  for ((index=0; index<count; index++)); do
+    path="groups.$index"
+    id="$(policy_value_raw "$destination/groups.json" "$path.id")"
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    name="$(policy_value_b64 "$destination/groups.json" "$path.name")"
+    enabled="$(policy_value_raw "$destination/groups.json" "$path.enabled")"
+    comment="$(policy_value_b64 "$destination/groups.json" "$path.comment")"
+    printf '%s' "$name" >"$destination/group-names/$id"
+    printf '%s|%s|%s\n' "$name" "$enabled" "$comment" >>"$destination/groups.unsorted"
+  done
+
+  count="$(policy_array_count "$destination/lists.json" lists)" || return 1
+  for ((index=0; index<count; index++)); do
+    path="lists.$index"
+    address="$(policy_value_b64 "$destination/lists.json" "$path.address")"
+    type="$(policy_value_raw "$destination/lists.json" "$path.type")"
+    enabled="$(policy_value_raw "$destination/lists.json" "$path.enabled")"
+    comment="$(policy_value_b64 "$destination/lists.json" "$path.comment")"
+    printf '%s|%s|%s|%s\n' "$address" "$type" "$enabled" "$comment" >>"$destination/adlists.unsorted"
+    group_count="$(policy_array_count "$destination/lists.json" "$path.groups")" || return 1
+    for ((group_index=0; group_index<group_count; group_index++)); do
+      group_id="$(policy_value_raw "$destination/lists.json" "$path.groups.$group_index")"
+      [[ "$group_id" =~ ^[0-9]+$ && -f "$destination/group-names/$group_id" ]] || return 1
+      group_name="$(<"$destination/group-names/$group_id")"
+      printf 'adlist|%s|%s|%s\n' "$address" "$type" "$group_name" >>"$destination/mappings.unsorted"
+    done
+  done
+
+  count="$(policy_array_count "$destination/domains.json" domains)" || return 1
+  for ((index=0; index<count; index++)); do
+    path="domains.$index"
+    domain="$(policy_value_b64 "$destination/domains.json" "$path.domain")"
+    type="$(policy_value_raw "$destination/domains.json" "$path.type")"
+    kind="$(policy_value_raw "$destination/domains.json" "$path.kind")"
+    enabled="$(policy_value_raw "$destination/domains.json" "$path.enabled")"
+    comment="$(policy_value_b64 "$destination/domains.json" "$path.comment")"
+    printf '%s|%s|%s|%s|%s\n' "$domain" "$type" "$kind" "$enabled" "$comment" >>"$destination/domains.unsorted"
+    group_count="$(policy_array_count "$destination/domains.json" "$path.groups")" || return 1
+    for ((group_index=0; group_index<group_count; group_index++)); do
+      group_id="$(policy_value_raw "$destination/domains.json" "$path.groups.$group_index")"
+      [[ "$group_id" =~ ^[0-9]+$ && -f "$destination/group-names/$group_id" ]] || return 1
+      group_name="$(<"$destination/group-names/$group_id")"
+      printf 'domain|%s|%s|%s|%s\n' "$domain" "$type" "$kind" "$group_name" >>"$destination/mappings.unsorted"
+    done
+  done
+
+  local family
+  for family in groups adlists domains mappings; do
+    LC_ALL=C sort -u "$destination/$family.unsorted" >"$destination/$family"
+  done
+}
+
+sync_compare_family() {
+  local label="$1" authority_file="$2" replica_file="$3" authority_count replica_count authority_only replica_only
+  authority_count="$(wc -l <"$authority_file" | tr -d ' ')"
+  replica_count="$(wc -l <"$replica_file" | tr -d ' ')"
+  if cmp -s "$authority_file" "$replica_file"; then
+    printf '[PASS] %s: %s record(s) match\n' "$label" "$authority_count"
+    return 0
+  fi
+  authority_only="$(comm -23 "$authority_file" "$replica_file" | wc -l | tr -d ' ')"
+  replica_only="$(comm -13 "$authority_file" "$replica_file" | wc -l | tr -d ' ')"
+  printf '[FAIL] %s differ: authority=%s replica=%s authority-only=%s replica-only=%s\n' \
+    "$label" "$authority_count" "$replica_count" "$authority_only" "$replica_only" >&2
+  return 1
+}
+
+sync_verify() {
+  local authority_id replica_id authority_file replica_file work_dir failed=0
+  [[ -f "$SYNC_CONFIG_FILE" ]] || die "Nebula Sync is not configured"
+  authority_id="$(config_value "$SYNC_CONFIG_FILE" AUTHORITY_ID)"
+  replica_id="$(config_value "$SYNC_CONFIG_FILE" REPLICA_ID)"
+  valid_instance_id "$authority_id" && valid_instance_id "$replica_id" || die "Nebula Sync endpoint configuration is invalid"
+  authority_file="$INSTANCES_DIR/$authority_id.conf"
+  replica_file="$INSTANCES_DIR/$replica_id.conf"
+  [[ -f "$authority_file" ]] || die "Configured authority is missing: $authority_id"
+  [[ -f "$replica_file" ]] || die "Configured replica is missing: $replica_id"
+  work_dir="$(mktemp -d "${TMPDIR:-/tmp}/adputate-sync-verify.XXXXXX")"
+  chmod 700 "$work_dir"
+  printf 'Verifying synchronized policy: %s -> %s (read-only)\n' "$authority_id" "$replica_id"
+  if ! sync_policy_snapshot "$authority_file" "$work_dir/authority"; then
+    rm -rf -- "$work_dir"
+    die "Could not read synchronization policy from $authority_id"
+  fi
+  if ! sync_policy_snapshot "$replica_file" "$work_dir/replica"; then
+    rm -rf -- "$work_dir"
+    die "Could not read synchronization policy from $replica_id"
+  fi
+  sync_compare_family Groups "$work_dir/authority/groups" "$work_dir/replica/groups" || failed=1
+  sync_compare_family Adlists "$work_dir/authority/adlists" "$work_dir/replica/adlists" || failed=1
+  sync_compare_family Domains "$work_dir/authority/domains" "$work_dir/replica/domains" || failed=1
+  sync_compare_family Mappings "$work_dir/authority/mappings" "$work_dir/replica/mappings" || failed=1
+  rm -rf -- "$work_dir"
+  if (( failed == 0 )); then
+    printf 'Synchronization policy matches. No Pi-hole state was changed.\n'
+  else
+    printf 'Synchronization policy differs. Run `%s host sync now`, then verify again.\n' "$CLI_NAME" >&2
+  fi
+  return "$failed"
+}
+
+sync_set_paused() {
+  local paused="$1" image interval stale_after authority replica
+  [[ -f "$SYNC_CONFIG_FILE" ]] || die "Nebula Sync is not configured"
+  image="$(config_value "$SYNC_CONFIG_FILE" IMAGE)"
+  interval="$(config_value "$SYNC_CONFIG_FILE" INTERVAL_SECONDS)"
+  stale_after="$(config_value "$SYNC_CONFIG_FILE" STALE_AFTER_SECONDS)"
+  authority="$(config_value "$SYNC_CONFIG_FILE" AUTHORITY_ID)"
+  replica="$(config_value "$SYNC_CONFIG_FILE" REPLICA_ID)"
+  write_sync_config "$image" "$interval" "$stale_after" "$paused" "$authority" "$replica"
+  if [[ "$paused" == "true" ]]; then printf 'Nebula Sync schedule paused.\n'; else printf 'Nebula Sync schedule resumed.\n'; fi
+}
+
+sync_logs() {
+  [[ -f "$SYNC_LOG_FILE" ]] || die "No Nebula Sync log exists yet"
+  tail -100 "$SYNC_LOG_FILE"
+}
+
+sync_remove() {
+  [[ "${1:-}" == "--yes" ]] || die "Refusing to remove sync lifecycle state without --yes"
+  if have_container && container_service_reachable && named_container_exists "$SYNC_CONTAINER_NAME"; then
+    "$CONTAINER_BIN" stop "$SYNC_CONTAINER_NAME" >/dev/null 2>&1 ||
+      die "Could not stop the active Nebula Sync container"
+    if named_container_exists "$SYNC_CONTAINER_NAME"; then
+      "$CONTAINER_BIN" delete "$SYNC_CONTAINER_NAME" >/dev/null 2>&1 ||
+        die "Could not remove the Nebula Sync container; lifecycle state was preserved"
+    fi
+  fi
+  local stale_env
+  for stale_env in "$DATA_DIR"/nebula-sync-env.*; do
+    [[ -f "$stale_env" ]] && rm -f -- "$stale_env"
+  done
+  rm -f -- "$SYNC_CONFIG_FILE" "$SYNC_STATE_FILE" "$SYNC_LOG_FILE"
+  rmdir "$SYNC_LOCK_DIR" 2>/dev/null || true
+  printf 'Removed Nebula Sync configuration, schedule state, and logs. Any Adputate-pulled image remains owned for host uninstall.\n'
+}
+
 launchd_plist() {
   local template="$PROJECT_ROOT/packaging/launchd/com.adputate.pihole.plist.template"
   [[ -f "$template" ]] || die "Launchd template not found: $template"
@@ -2210,6 +2658,7 @@ host_uninstall_audit() {
 
   if command -v "$CONTAINER_BIN" >/dev/null 2>&1 && container_service_reachable; then
     container_exists && check_fail "$CONTAINER_NAME still exists" || check_pass "No Adputate container"
+    named_container_exists "$SYNC_CONTAINER_NAME" && check_fail "$SYNC_CONTAINER_NAME still exists" || check_pass "No Nebula Sync container"
     volume_exists "$ETC_PIHOLE_VOLUME" && check_fail "$ETC_PIHOLE_VOLUME still exists" || check_pass "No Pi-hole volume"
     volume_exists "$ETC_DNSMASQ_VOLUME" && check_fail "$ETC_DNSMASQ_VOLUME still exists" || check_pass "No dnsmasq volume"
     if [[ -f "$image_manifest" ]]; then
@@ -2236,6 +2685,14 @@ host_uninstall_audit() {
     check_fail "Local-host runtime configuration remains at $RUNTIME_CONFIG_FILE"
   [[ ! -e "$ENV_FILE" ]] && check_pass "No local Pi-hole environment file" || \
     check_fail "Local Pi-hole environment remains at $ENV_FILE"
+  [[ ! -e "$SYNC_CONFIG_FILE" && ! -e "$SYNC_STATE_FILE" && ! -e "$SYNC_LOCK_DIR" ]] && \
+    check_pass "No Nebula Sync lifecycle state" || check_fail "Nebula Sync lifecycle state remains"
+  local stale_sync_env sync_env_count=0
+  for stale_sync_env in "$DATA_DIR"/nebula-sync-env.*; do
+    [[ -f "$stale_sync_env" ]] && sync_env_count=$((sync_env_count + 1))
+  done
+  (( sync_env_count == 0 )) && check_pass "No Nebula Sync credential files" ||
+    check_fail "$sync_env_count Nebula Sync credential file(s) remain"
   local managed_file managed_count=0
   for managed_file in "$INSTANCES_DIR"/*.conf; do
     [[ -f "$managed_file" ]] || continue
@@ -2296,6 +2753,10 @@ host_uninstall() {
   fi
   service_uninstall >/dev/null 2>&1 || true
   if (( container_available == 1 )); then
+    if named_container_exists "$SYNC_CONTAINER_NAME"; then
+      "$CONTAINER_BIN" stop "$SYNC_CONTAINER_NAME" >/dev/null 2>&1 || true
+      "$CONTAINER_BIN" delete "$SYNC_CONTAINER_NAME" >/dev/null 2>&1 || cleanup_failed=1
+    fi
     reset_container
     "$CONTAINER_BIN" volume delete "$ETC_PIHOLE_VOLUME" >/dev/null 2>&1 || true
     "$CONTAINER_BIN" volume delete "$ETC_DNSMASQ_VOLUME" >/dev/null 2>&1 || true
@@ -2318,7 +2779,13 @@ host_uninstall() {
   [[ -n "$APP_DIR" && "$APP_DIR" != "/" && "$APP_DIR" != "$HOME" && ${#APP_DIR} -gt 8 ]] || \
     die "Refusing to clean unsafe application data path: $APP_DIR"
   if (( cleanup_failed == 0 )); then
-    rm -f -- "$RUNTIME_CONFIG_FILE" "$ENV_FILE" "$OWNED_IMAGES_FILE" "$CONTAINER_SYSTEM_MARKER"
+    rm -f -- "$RUNTIME_CONFIG_FILE" "$ENV_FILE" "$OWNED_IMAGES_FILE" "$CONTAINER_SYSTEM_MARKER" \
+      "$SYNC_CONFIG_FILE" "$SYNC_STATE_FILE"
+    local stale_sync_env
+    for stale_sync_env in "$DATA_DIR"/nebula-sync-env.*; do
+      [[ -f "$stale_sync_env" ]] && rm -f -- "$stale_sync_env"
+    done
+    rmdir "$SYNC_LOCK_DIR" 2>/dev/null || true
     rm -rf -- "$LOG_DIR" "$TELEPORTER_DIR"
     local managed_file
     for managed_file in "$INSTANCES_DIR"/*.conf; do
@@ -2344,7 +2811,8 @@ host_uninstall() {
 }
 
 host_artifacts_present() {
-  [[ -e "$RUNTIME_CONFIG_FILE" || -e "$ENV_FILE" || -e "$(launchd_plist_path)" || \
+  [[ -e "$RUNTIME_CONFIG_FILE" || -e "$ENV_FILE" || -e "$SYNC_CONFIG_FILE" || \
+     -e "$SYNC_STATE_FILE" || -e "$(launchd_plist_path)" || \
      -e "$ROUTER_PLIST_PATH" || -e "$ROUTER_SUPPORT_DIR" ]] && return 0
   command -v "$CONTAINER_BIN" >/dev/null 2>&1 && container_service_reachable && container_exists
 }
@@ -2540,6 +3008,18 @@ host_command() {
         *) die "Usage: $CLI_NAME host blocking status|enable|disable [time]" ;;
       esac ;;
     password) password ;;
+    sync)
+      case "${1:-}" in
+        configure) shift; sync_configure "$@" ;;
+        status) sync_status ;;
+        now) sync_now ;;
+        verify) sync_verify ;;
+        pause) sync_set_paused true ;;
+        resume) sync_set_paused false ;;
+        logs) sync_logs ;;
+        remove) shift; sync_remove "${1:-}" ;;
+        *) die "Usage: $CLI_NAME host sync configure --yes|status|now|verify|pause|resume|logs|remove --yes" ;;
+      esac ;;
     service) host_service_command "$@" ;;
     router) host_router_command "$@" ;;
     teleporter)

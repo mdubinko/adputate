@@ -17,6 +17,7 @@ adputate query <text> [--since 1h]
 adputate blocking status|disable 5m|enable
 
 adputate host ...
+adputate host sync configure|status|now|pause|resume|logs|remove
 ```
 
 The top-level commands are portable controller operations. They call the Pi-hole v6 APIs directly and can run from the normal operator workstation after its instance inventory and Keychain credentials have been configured. SSH is not part of the normal query, status, or blocking workflow. `adputate host ...` is reserved for operations on the Mac that actually runs the Adputate container, port-53 frontend, and launchd jobs.
@@ -250,38 +251,41 @@ The command must never claim “blocking disabled” without confirming every in
 
 ### 6. Integrate pinned selective Nebula Sync
 
-- Keep the selected `ghcr.io/lovelaze/nebula-sync:v0.11.2` release pinned and add its tested immutable image digest before enabling synchronization.
-- Generate the selective configuration from the shared-policy allowlist.
-- Keep credentials out of environment examples and process listings where possible; provide them to the isolated sync process through protected files derived from Keychain at launch.
-- Run Nebula Sync as a separately identifiable, least-privileged component.
-- Do not grant access to Adputate's Pi-hole volumes unless strictly required.
-- Set bounded timeouts and retries.
-- Capture structured last-run, last-success, duration, source version, target version, and error state.
-- Run gravity only where required, and avoid unnecessary simultaneous work on both DNS servers.
+The initial lifecycle is implemented for exactly one active remote authority and one active managed-local replica. It generates the selective groups/adlists/domains profile from fixed allowlisted flags, uses the pinned `ghcr.io/lovelaze/nebula-sync:v0.11.2` release, runs a named ephemeral read-only container with no Pi-hole volume access, supplies Keychain/local credentials through a mode-0600 temporary environment file, removes that file on exit, applies bounded client timeouts, keeps a bounded log, and records last attempt, last success, duration, and result.
+
+Configuration is explicit and starts paused. It also enables Pi-hole's required `webserver.api.app_sudo` setting on the managed replica. Full Teleporter sync, client mappings, node-local configuration, and Nebula's internal cron scheduler remain disabled.
+
+Still required:
+
+- Add and test the immutable arm64/multi-architecture image digest rather than relying only on the release tag.
+- Validate the exact selective profile against both real Pi-holes, including create/update/delete and mapping convergence.
+- Capture source and target Pi-hole versions with each run.
+- Verify that Nebula Sync never emits credentials into its own output.
 
 Exit condition: changing, adding, and deleting every shared-policy object on the NUC converges on Adputate without changing any node-local setting.
 
 ### 7. Add sync orchestration
 
-Add:
+Implemented as host-local lifecycle commands:
 
 ```text
-adputate sync status
-adputate sync now
-adputate sync pause
-adputate sync resume
+adputate host sync configure --yes
+adputate host sync status
+adputate host sync now
+adputate host sync pause
+adputate host sync resume
+adputate host sync logs
+adputate host sync remove --yes
 ```
 
-The scheduler must:
+The existing recovery LaunchAgent evaluates the five-minute default schedule every minute, catches up after downtime, prevents overlapping runs with a recoverable lock, and leaves DNS serving last-good policy on failure. Initial synchronization and schedule activation are separate explicit actions.
 
-- perform an initial sync after pairing only with explicit confirmation;
-- run often enough that interactive allowlist changes are useful;
-- catch up promptly after the Mac wakes or returns to the network;
-- prevent overlapping runs;
-- leave both Pi-holes serving last-good data during failure;
-- use exponential backoff with an upper bound;
-- retain concise, bounded run history; and
-- surface stale replication through `health` and `doctor`.
+Still required:
+
+- Add exponential backoff rather than the current fixed-interval retry.
+- Retain a concise multi-run history rather than only bounded logs and latest state.
+- Surface stale replication through cluster `status`, `health`, and `doctor`.
+- Add a remote control plane if manual `sync now` from a controller-only workstation becomes a requirement; scheduled operation does not require SSH, but manual lifecycle commands currently do.
 
 The replica's admin panel remains usable for inspection, but documentation must warn that direct policy changes there may be overwritten.
 
@@ -337,6 +341,8 @@ Install/upgrade must account for:
 - scheduler/launchd artifacts;
 - bounded sync logs; and
 - version migrations.
+
+Host uninstall and uninstall audit now include the ephemeral sync container, lifecycle configuration, latest state, lock, bounded log, and any sync image that Adputate recorded pulling. `host sync remove --yes` removes sync configuration, schedule state, and logs without changing either Pi-hole; the owned image remains available for the complete host-uninstall lifecycle.
 
 `unpair` removes pairing automation and credentials but leaves the standalone Adputate Pi-hole running.
 
@@ -437,7 +443,7 @@ These are implementation-time decisions, not reasons to block initial work:
 - Whether local DNS and CNAME records belong in the first shared-policy profile
 - Whether client and client-group mappings are enabled by default
 - Default sync interval and staleness warning threshold
-- Whether Nebula Sync runs continuously with its own scheduler or once per Adputate-managed launch
+- Whether manual sync lifecycle operations need a dedicated remote control plane beyond SSH; scheduled sync already uses Adputate-managed one-shot launches
 - Supported TLS policy for a peer using a private/self-signed certificate
 - Default domain/client redaction policy for support bundles
 - Whether a small cluster control page is part of Milestone 1 or follows immediately afterward
