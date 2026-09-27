@@ -57,6 +57,13 @@ HOST_WEB_PORT="${ADPUTATE_WEB_PORT:-${ADPUTATE_CONFIG_WEB_PORT:-8080}}"
 HOST_DNS_PORT="${ADPUTATE_DNS_PORT:-${ADPUTATE_CONFIG_DNS_PORT:-5053}}"
 HOST_BIND_ADDRESS="${ADPUTATE_BIND_ADDRESS:-${ADPUTATE_CONFIG_BIND_ADDRESS:-127.0.0.1}}"
 ROUTER_INTERFACE="${ADPUTATE_ROUTER_INTERFACE:-${ADPUTATE_CONFIG_ROUTER_INTERFACE:-}}"
+if [[ -n "${ADPUTATE_UPSTREAMS:-}" ]]; then
+  PIHOLE_UPSTREAMS="$ADPUTATE_UPSTREAMS"
+  PIHOLE_UPSTREAM_SOURCE="${ADPUTATE_UPSTREAM_SOURCE:-explicit environment override}"
+else
+  PIHOLE_UPSTREAMS="${ADPUTATE_CONFIG_UPSTREAMS:-}"
+  PIHOLE_UPSTREAM_SOURCE="${ADPUTATE_CONFIG_UPSTREAM_SOURCE:-not-configured}"
+fi
 ROUTER_SERVICE_LABEL="${ADPUTATE_ROUTER_SERVICE_LABEL:-com.${CLI_NAME}.dns-forwarder}"
 ROUTER_SUPPORT_DIR="${ADPUTATE_ROUTER_SUPPORT_DIR:-/Library/Application Support/$APP_NAME}"
 ROUTER_PLIST_PATH="${ADPUTATE_ROUTER_PLIST_PATH:-/Library/LaunchDaemons/$ROUTER_SERVICE_LABEL.plist}"
@@ -66,13 +73,13 @@ CLUSTER_CONFIG_FILE="$CONFIG_DIR/cluster.conf"
 INSTANCES_DIR="$CONFIG_DIR/instances.d"
 QUERY_SNAPSHOT_ROOT="$APP_DIR/query-snapshots"
 KEYCHAIN_SERVICE="${ADPUTATE_KEYCHAIN_SERVICE:-com.${CLI_NAME}.pihole.instance}"
-DEFAULT_PIHOLE_UPSTREAMS="1.1.1.1;9.9.9.9"
 CURL_BIN="${ADPUTATE_CURL_BIN:-/usr/bin/curl}"
 SECURITY_BIN="${ADPUTATE_SECURITY_BIN:-/usr/bin/security}"
 PLUTIL_BIN="${ADPUTATE_PLUTIL_BIN:-/usr/bin/plutil}"
 SCUTIL_BIN="${ADPUTATE_SCUTIL_BIN:-/usr/sbin/scutil}"
 NETWORKSETUP_BIN="${ADPUTATE_NETWORKSETUP_BIN:-/usr/sbin/networksetup}"
 ROUTE_BIN="${ADPUTATE_ROUTE_BIN:-/sbin/route}"
+IPCONFIG_BIN="${ADPUTATE_IPCONFIG_BIN:-/usr/sbin/ipconfig}"
 DIG_BIN="${ADPUTATE_DIG_BIN:-/usr/bin/dig}"
 SUDO_BIN="${ADPUTATE_SUDO_BIN:-/usr/bin/sudo}"
 PBCOPY_BIN="${ADPUTATE_PBCOPY_BIN:-/usr/bin/pbcopy}"
@@ -110,7 +117,7 @@ Controller commands (work from any Mac with Adputate and its configuration):
 
 Host commands (run on the always-on Mac Studio that hosts Adputate):
   host config|doctor|health|status|start|ensure|stop|restart|logs|admin|shell|smoke
-  host configure [options]       Persist the container host configuration.
+  host configure [options]       Persist host settings; --upstreams defaults to router.
   host register [id]             Explicitly add this host as a replica endpoint.
   host reconcile --yes           Recreate a drifted container, preserving data.
   host blocking status|enable|disable [time]
@@ -284,12 +291,13 @@ container_drift_report() {
       drift=1
     fi
   done <<EOF
-0.configuration.labels.adputate_config_version|1
+0.configuration.labels.adputate_config_version|2
 0.configuration.labels.adputate_bind_address|$HOST_BIND_ADDRESS
 0.configuration.labels.adputate_web_port|$HOST_WEB_PORT
 0.configuration.labels.adputate_dns_port|$HOST_DNS_PORT
 0.configuration.labels.adputate_image|$IMAGE
 0.configuration.labels.adputate_memory|$MEMORY
+0.configuration.labels.adputate_upstreams|$PIHOLE_UPSTREAMS
 EOF
 
   rm -f "$inspection"
@@ -424,7 +432,8 @@ show_instances() {
   if [[ -f "$ENV_FILE" ]]; then
     upstreams="$(awk -F= '$1 == "FTLCONF_dns_upstreams" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
     if [[ -n "$upstreams" ]]; then
-      printf 'Local upstreams:  %s (currently fixed by Adputate)\n' "$upstreams"
+      printf 'Local upstreams:  %s\n' "$upstreams"
+      printf 'Upstream source:  %s\n' "$PIHOLE_UPSTREAM_SOURCE"
     else
       printf 'Local upstreams:  not forced; Pi-hole configuration applies\n'
     fi
@@ -922,11 +931,87 @@ image_is_pinned() {
 }
 
 detect_default_interface() {
-  /sbin/route -n get default 2>/dev/null | awk '$1 == "interface:" {print $2; exit}'
+  "$ROUTE_BIN" -n get default 2>/dev/null | awk '$1 == "interface:" {print $2; exit}'
+}
+
+normalize_upstreams() {
+  local raw="$1" endpoint normalized=""
+  raw="${raw//,/;}"
+  while IFS= read -r endpoint; do
+    [[ -n "$endpoint" ]] || continue
+    valid_dns_endpoint "$endpoint" || return 1
+    if [[ ";${normalized};" != *";$endpoint;"* ]]; then
+      normalized="${normalized:+$normalized;}$endpoint"
+    fi
+  done < <(printf '%s\n' "$raw" | tr ';' '\n')
+  [[ -n "$normalized" ]] || return 1
+  printf '%s' "$normalized"
+}
+
+upstream_conflicts_with_pihole() {
+  local endpoint="$1" address file configured
+  address="${endpoint%%#*}"
+  [[ "$address" != "0.0.0.0" && "$address" != 127.* && "$address" != "::1" &&
+     "$address" != "[::1]" && "$address" != "localhost" && "$address" != "$HOST_BIND_ADDRESS" ]] || return 0
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    configured="$(config_value "$file" DNS_ENDPOINT)"
+    [[ "${configured%%#*}" != "$address" ]] || return 0
+  done < <(instance_files)
+  return 1
+}
+
+validate_upstreams_do_not_loop() {
+  local upstreams="$1" endpoint
+  while IFS= read -r endpoint; do
+    upstream_conflicts_with_pihole "$endpoint" &&
+      die "Upstream $endpoint points at this host or a configured Pi-hole; that would create a DNS loop"
+  done < <(printf '%s\n' "$upstreams" | tr ';' '\n')
+  return 0
+}
+
+upstream_dns_works() {
+  local endpoint="$1" address port output
+  address="${endpoint%%#*}"
+  port="${endpoint##*#}"
+  [[ "$endpoint" == *'#'* ]] || port=53
+  output="$("$DIG_BIN" +time=2 +tries=1 +short @"$address" -p "$port" example.com A 2>/dev/null)" || return 1
+  [[ -n "$output" ]]
+}
+
+router_upstream_selection() {
+  local interface candidates="" normalized gateway
+  interface="${ROUTER_INTERFACE:-$(detect_default_interface)}"
+  [[ -n "$interface" ]] || die "Could not determine the default-route interface; pass --upstreams explicitly"
+
+  if [[ -x "$IPCONFIG_BIN" ]]; then
+    candidates="$("$IPCONFIG_BIN" getpacket "$interface" 2>/dev/null | awk '
+      /domain_name_server/ {
+        line=$0
+        gsub(/[^0-9.]+/, " ", line)
+        count=split(line, values, /[[:space:]]+/)
+        for (i=1; i<=count; i++) if (values[i] ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) print values[i]
+      }
+    ' || true)"
+  fi
+
+  if [[ -n "$candidates" ]]; then
+    normalized="$(printf '%s\n' "$candidates" | paste -sd ';' -)"
+    normalized="$(normalize_upstreams "$normalized")" || die "The router supplied an invalid DNS resolver"
+    validate_upstreams_do_not_loop "$normalized"
+    printf 'router DHCP (%s)|%s' "$interface" "$normalized"
+    return
+  fi
+
+  gateway="$("$ROUTE_BIN" -n get default 2>/dev/null | awk '$1 == "gateway:" {print $2; exit}')"
+  valid_ipv4 "$gateway" || die "The router did not advertise a usable DNS resolver; pass --upstreams explicitly"
+  validate_upstreams_do_not_loop "$gateway"
+  printf 'default router (%s)|%s' "$interface" "$gateway"
 }
 
 write_runtime_config() {
   local bind_address="$1" web_port="$2" dns_port="$3" image="$4" memory="$5" router_interface="$6"
+  local upstreams="$7" upstream_source="$8"
   local temporary
   ensure_dirs
   temporary="$(mktemp "$CONFIG_DIR/runtime.env.XXXXXX")"
@@ -939,13 +1024,27 @@ write_runtime_config() {
     printf 'ADPUTATE_CONFIG_IMAGE=%q\n' "$image"
     printf 'ADPUTATE_CONFIG_MEMORY=%q\n' "$memory"
     printf 'ADPUTATE_CONFIG_ROUTER_INTERFACE=%q\n' "$router_interface"
+    printf 'ADPUTATE_CONFIG_UPSTREAMS=%q\n' "$upstreams"
+    printf 'ADPUTATE_CONFIG_UPSTREAM_SOURCE=%q\n' "$upstream_source"
   } >"$temporary"
   mv "$temporary" "$RUNTIME_CONFIG_FILE"
 }
 
 ensure_runtime_config() {
-  [[ -f "$RUNTIME_CONFIG_FILE" ]] || write_runtime_config \
-    "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE"
+  local selection
+  [[ -f "$RUNTIME_CONFIG_FILE" ]] && return
+  if [[ -z "$PIHOLE_UPSTREAMS" ]]; then
+    selection="$(router_upstream_selection)"
+    PIHOLE_UPSTREAM_SOURCE="${selection%%|*}"
+    PIHOLE_UPSTREAMS="${selection#*|}"
+  else
+    PIHOLE_UPSTREAMS="$(normalize_upstreams "$PIHOLE_UPSTREAMS")" || die "Invalid Pi-hole upstream list"
+    PIHOLE_UPSTREAM_SOURCE="${ADPUTATE_UPSTREAM_SOURCE:-explicit environment override}"
+    validate_upstreams_do_not_loop "$PIHOLE_UPSTREAMS"
+  fi
+  write_runtime_config \
+    "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE" \
+    "$PIHOLE_UPSTREAMS" "$PIHOLE_UPSTREAM_SOURCE"
 }
 
 show_host_config() {
@@ -956,6 +1055,8 @@ show_host_config() {
   printf 'Image:         %s\n' "$IMAGE"
   printf 'Memory:        %s\n' "$MEMORY"
   printf 'LAN interface: %s\n' "${ROUTER_INTERFACE:-not configured}"
+  printf 'Upstreams:     %s\n' "${PIHOLE_UPSTREAMS:-not configured}"
+  printf 'Source:        %s\n' "$PIHOLE_UPSTREAM_SOURCE"
   if [[ -f "$ROUTER_PLIST_PATH" ]]; then
     printf 'Port 53:       installed\n'
   else
@@ -966,6 +1067,7 @@ show_host_config() {
 configure_runtime() {
   local bind_address="$HOST_BIND_ADDRESS" web_port="$HOST_WEB_PORT" dns_port="$HOST_DNS_PORT"
   local image="$IMAGE" memory="$MEMORY" router_interface="$ROUTER_INTERFACE"
+  local upstreams="$PIHOLE_UPSTREAMS" upstream_source="$PIHOLE_UPSTREAM_SOURCE" upstream_request=""
 
   while (( $# > 0 )); do
     case "$1" in
@@ -975,6 +1077,7 @@ configure_runtime() {
       --image) (( $# >= 2 )) || die "--image requires a value"; image="$2"; shift 2 ;;
       --memory) (( $# >= 2 )) || die "--memory requires a value"; memory="$2"; shift 2 ;;
       --router-interface) (( $# >= 2 )) || die "--router-interface requires a value"; router_interface="$2"; shift 2 ;;
+      --upstreams) (( $# >= 2 )) || die "--upstreams requires router or a resolver list"; upstream_request="$2"; shift 2 ;;
       --show) show_host_config; return ;;
       *) die "Unknown configure option: $1" ;;
     esac
@@ -990,6 +1093,19 @@ configure_runtime() {
   [[ "$image" != *[[:space:]]* ]] || die "Image reference may not contain whitespace"
   valid_memory "$memory" || die "Memory must look like 256M or 1G: $memory"
 
+  if [[ "$upstream_request" == "router" || ( -z "$upstream_request" && -z "$upstreams" ) ]]; then
+    local selection
+    ROUTER_INTERFACE="$router_interface"
+    selection="$(router_upstream_selection)"
+    upstream_source="${selection%%|*}"
+    upstreams="${selection#*|}"
+  elif [[ -n "$upstream_request" ]]; then
+    upstreams="$(normalize_upstreams "$upstream_request")" ||
+      die "Upstreams must be 'router' or a comma/semicolon-separated list of address[#port] values"
+    upstream_source="explicit"
+    validate_upstreams_do_not_loop "$upstreams"
+  fi
+
   if [[ "$bind_address" != "127.0.0.1" ]]; then
     [[ -n "$router_interface" ]] || router_interface="$(detect_default_interface)"
     [[ -n "$router_interface" ]] || die "Could not detect the default LAN interface; pass --router-interface"
@@ -998,7 +1114,7 @@ configure_runtime() {
       die "$bind_address is not assigned to interface $router_interface"
   fi
 
-  write_runtime_config "$bind_address" "$web_port" "$dns_port" "$image" "$memory" "$router_interface"
+  write_runtime_config "$bind_address" "$web_port" "$dns_port" "$image" "$memory" "$router_interface" "$upstreams" "$upstream_source"
   printf 'Saved runtime configuration.\n'
   ADPUTATE_CONFIG_BIND_ADDRESS="$bind_address"
   ADPUTATE_CONFIG_WEB_PORT="$web_port"
@@ -1006,12 +1122,17 @@ configure_runtime() {
   ADPUTATE_CONFIG_IMAGE="$image"
   ADPUTATE_CONFIG_MEMORY="$memory"
   ADPUTATE_CONFIG_ROUTER_INTERFACE="$router_interface"
+  ADPUTATE_CONFIG_UPSTREAMS="$upstreams"
+  ADPUTATE_CONFIG_UPSTREAM_SOURCE="$upstream_source"
   HOST_BIND_ADDRESS="$bind_address"
   HOST_WEB_PORT="$web_port"
   HOST_DNS_PORT="$dns_port"
   IMAGE="$image"
   MEMORY="$memory"
   ROUTER_INTERFACE="$router_interface"
+  PIHOLE_UPSTREAMS="$upstreams"
+  PIHOLE_UPSTREAM_SOURCE="$upstream_source"
+  sync_pihole_upstreams
   show_host_config
 }
 
@@ -1039,12 +1160,29 @@ init_config() {
 TZ=$(detect_timezone)
 FTLCONF_webserver_api_password=$password
 FTLCONF_dns_listeningMode=ALL
-FTLCONF_dns_upstreams=$DEFAULT_PIHOLE_UPSTREAMS
+FTLCONF_dns_upstreams=$PIHOLE_UPSTREAMS
 EOF
     chmod 600 "$ENV_FILE"
-  elif grep -q '^TZ=$' "$ENV_FILE"; then
-    sed -i '' "s#^TZ=.*#TZ=$(detect_timezone)#" "$ENV_FILE"
+  else
+    if grep -q '^TZ=$' "$ENV_FILE"; then
+      sed -i '' "s#^TZ=.*#TZ=$(detect_timezone)#" "$ENV_FILE"
+    fi
+    sync_pihole_upstreams
   fi
+}
+
+sync_pihole_upstreams() {
+  local temporary
+  [[ -f "$ENV_FILE" && -n "$PIHOLE_UPSTREAMS" ]] || return 0
+  temporary="$(mktemp "$CONFIG_DIR/pihole.env.XXXXXX")"
+  chmod 600 "$temporary"
+  awk -v upstreams="$PIHOLE_UPSTREAMS" '
+    BEGIN { found=0 }
+    /^FTLCONF_dns_upstreams=/ { print "FTLCONF_dns_upstreams=" upstreams; found=1; next }
+    { print }
+    END { if (!found) print "FTLCONF_dns_upstreams=" upstreams }
+  ' "$ENV_FILE" >"$temporary"
+  mv "$temporary" "$ENV_FILE"
 }
 
 warp_connected() {
@@ -1214,6 +1352,26 @@ doctor() {
     check_pass "Persistent runtime configuration found"
   else
     check_warn "Persistent runtime configuration is not initialized; run: $CLI_NAME host configure"
+  fi
+
+  if [[ -n "$PIHOLE_UPSTREAMS" ]]; then
+    local upstream normalized_upstreams
+    if normalized_upstreams="$(normalize_upstreams "$PIHOLE_UPSTREAMS")"; then
+      check_pass "Pi-hole upstream syntax is valid: $normalized_upstreams"
+      while IFS= read -r upstream; do
+        if upstream_conflicts_with_pihole "$upstream"; then
+          check_fail "Pi-hole upstream would create a direct DNS loop: $upstream"
+        elif upstream_dns_works "$upstream"; then
+          check_pass "Pi-hole upstream answers DNS directly: $upstream"
+        else
+          check_fail "Pi-hole upstream did not answer DNS directly: $upstream"
+        fi
+      done < <(printf '%s\n' "$normalized_upstreams" | tr ';' '\n')
+    else
+      check_fail "Pi-hole upstream syntax is invalid: $PIHOLE_UPSTREAMS"
+    fi
+  else
+    check_warn "Pi-hole upstreams are not configured; run: $CLI_NAME host configure --upstreams router"
   fi
 
   if [[ "$HOST_WEB_PORT" =~ ^[0-9]+$ ]] && (( HOST_WEB_PORT >= 1 && HOST_WEB_PORT <= 65535 )); then
@@ -1641,12 +1799,13 @@ create_pihole() {
     --platform linux/arm64 \
     --cpus 1 \
     --memory "$MEMORY" \
-    --label adputate_config_version=1 \
+    --label adputate_config_version=2 \
     --label "adputate_bind_address=$HOST_BIND_ADDRESS" \
     --label "adputate_web_port=$HOST_WEB_PORT" \
     --label "adputate_dns_port=$HOST_DNS_PORT" \
     --label "adputate_image=$IMAGE" \
     --label "adputate_memory=$MEMORY" \
+    --label "adputate_upstreams=$PIHOLE_UPSTREAMS" \
     --env-file "$ENV_FILE" \
     --publish "$HOST_BIND_ADDRESS:$HOST_WEB_PORT:80/tcp" \
     --publish "$HOST_BIND_ADDRESS:$HOST_DNS_PORT:53/tcp" \
@@ -1893,7 +2052,8 @@ upgrade_pihole() {
   "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
   "$CONTAINER_BIN" delete "$CONTAINER_NAME"
   IMAGE="$target_image"
-  write_runtime_config "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE"
+  write_runtime_config "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE" \
+    "$PIHOLE_UPSTREAMS" "$PIHOLE_UPSTREAM_SOURCE"
 
   if create_pihole && wait_for_ready; then
     printf 'Upgrade succeeded: %s -> %s\n' "$old_image" "$target_image"
@@ -1904,7 +2064,8 @@ upgrade_pihole() {
   "$CONTAINER_BIN" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
   "$CONTAINER_BIN" delete "$CONTAINER_NAME" >/dev/null 2>&1 || true
   IMAGE="$old_image"
-  write_runtime_config "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE"
+  write_runtime_config "$HOST_BIND_ADDRESS" "$HOST_WEB_PORT" "$HOST_DNS_PORT" "$IMAGE" "$MEMORY" "$ROUTER_INTERFACE" \
+    "$PIHOLE_UPSTREAMS" "$PIHOLE_UPSTREAM_SOURCE"
   create_pihole
   wait_for_ready || die "Upgrade and rollback both failed; backup is in $backup_dir"
   die "Upgrade failed and the previous image was restored; backup is in $backup_dir"

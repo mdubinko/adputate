@@ -49,7 +49,7 @@ case "${1:-}" in
   inspect)
     [[ "$system_state" == "running" ]] || exit 125
     cat <<JSON
-[{"configuration":{"labels":{"adputate_config_version":"1","adputate_bind_address":"127.0.0.1","adputate_web_port":"19080","adputate_dns_port":"15053","adputate_image":"pihole/pihole:2026.07.2","adputate_memory":"256M"},"image":{"reference":"docker.io/pihole/pihole:2026.07.2"}}}]
+    [{"configuration":{"labels":{"adputate_config_version":"2","adputate_bind_address":"127.0.0.1","adputate_web_port":"19080","adputate_dns_port":"15053","adputate_image":"pihole/pihole:2026.07.2","adputate_memory":"256M","adputate_upstreams":"192.168.86.1"},"image":{"reference":"docker.io/pihole/pihole:2026.07.2"}}}]
 JSON
     ;;
   volume)
@@ -124,9 +124,17 @@ chmod +x "$FAKE_SCUTIL"
 FAKE_ROUTE="$TEST_TMP/route"
 cat >"$FAKE_ROUTE" <<'EOF'
 #!/usr/bin/env bash
+printf '     gateway: 192.168.86.1\n'
 printf '   interface: en7\n'
 EOF
 chmod +x "$FAKE_ROUTE"
+
+FAKE_IPCONFIG="$TEST_TMP/ipconfig"
+cat >"$FAKE_IPCONFIG" <<'EOF'
+#!/usr/bin/env bash
+printf 'domain_name_server (ip_mult): {192.168.86.1}\n'
+EOF
+chmod +x "$FAKE_IPCONFIG"
 
 FAKE_DNS_STATE="$TEST_TMP/client-dns-state"
 printf '192.168.86.1\n' >"$FAKE_DNS_STATE"
@@ -230,6 +238,7 @@ export ADPUTATE_ROUTER_LOG_PATH="$TEST_TMP/adputate-dns-forwarder.log"
 export ADPUTATE_CURL_BIN="$FAKE_CURL"
 export ADPUTATE_SCUTIL_BIN="$FAKE_SCUTIL"
 export ADPUTATE_ROUTE_BIN="$FAKE_ROUTE"
+export ADPUTATE_IPCONFIG_BIN="$FAKE_IPCONFIG"
 export ADPUTATE_NETWORKSETUP_BIN="$FAKE_NETWORKSETUP"
 export ADPUTATE_SUDO_BIN="$FAKE_SUDO"
 export ADPUTATE_DIG_BIN="$FAKE_DIG"
@@ -293,6 +302,18 @@ ADPUTATE_APP_DIR="$VALIDATION_APP" "$CLI" instance add tls --role replica \
   --api-url https://192.0.2.60 --dns 192.0.2.60#53 --no-auth >/dev/null
 grep -Fxq 'TRANSPORT=https' "$VALIDATION_APP/config/instances.d/tls.conf" || \
   fail 'HTTPS instance metadata reported the wrong transport'
+if ADPUTATE_APP_DIR="$VALIDATION_APP" "$CLI" host configure --upstreams 192.0.2.60 \
+    >"$TEST_TMP/peer-upstream-loop.out" 2>&1; then
+  fail 'configure accepted a configured Pi-hole as an upstream'
+fi
+assert_contains "$(cat "$TEST_TMP/peer-upstream-loop.out")" 'would create a DNS loop'
+
+FALLBACK_APP="$TEST_TMP/router-fallback-app"
+ADPUTATE_APP_DIR="$FALLBACK_APP" ADPUTATE_IPCONFIG_BIN="$TEST_TMP/missing-ipconfig" \
+  "$CLI" host configure >/dev/null
+output="$(ADPUTATE_APP_DIR="$FALLBACK_APP" "$CLI" host config)"
+assert_contains "$output" 'Upstreams:     192.168.86.1'
+assert_contains "$output" 'Source:        default router (en7)'
 
 AUTH_APP="$TEST_TMP/auth-app"
 printf 'test-secret\n' | ADPUTATE_APP_DIR="$AUTH_APP" "$CLI" instance add secure --role authority \
@@ -342,8 +363,29 @@ output="$($CLI host config)"
 assert_contains "$output" 'Bind address:  127.0.0.1'
 assert_contains "$output" 'Web port:      19080'
 assert_contains "$output" 'DNS backend:   15053'
+assert_contains "$output" 'Upstreams:     192.168.86.1'
+assert_contains "$output" 'Source:        router DHCP (en7)'
+grep -Fxq 'ADPUTATE_CONFIG_UPSTREAMS=192.168.86.1' "$ADPUTATE_APP_DIR/config/runtime.env" ||
+  fail 'runtime config did not persist the router-provided upstream'
+
+if $CLI host configure --upstreams 127.0.0.1 >"$TEST_TMP/upstream-loop.out" 2>&1; then
+  fail 'configure accepted a loopback upstream'
+fi
+assert_contains "$(cat "$TEST_TMP/upstream-loop.out")" 'would create a DNS loop'
+if $CLI host configure --upstreams ::1 >"$TEST_TMP/upstream-v6-loop.out" 2>&1; then
+  fail 'configure accepted an IPv6 loopback upstream'
+fi
+assert_contains "$(cat "$TEST_TMP/upstream-v6-loop.out")" 'would create a DNS loop'
+
+$CLI host configure --upstreams '9.9.9.9;149.112.112.112' >/dev/null
+output="$($CLI host config)"
+assert_contains "$output" 'Upstreams:     9.9.9.9;149.112.112.112'
+assert_contains "$output" 'Source:        explicit'
+$CLI host configure --upstreams router >/dev/null
 
 $CLI host init >/dev/null
+grep -Fxq 'FTLCONF_dns_upstreams=192.168.86.1' "$ADPUTATE_APP_DIR/config/pihole.env" ||
+  fail 'Pi-hole environment did not receive the router-provided upstream'
 : >"$ADPUTATE_ROUTER_PLIST_PATH"
 $CLI host register >/dev/null
 output="$($CLI instance list)"
@@ -428,7 +470,8 @@ $CLI host start >/dev/null
 [[ "$(cat "$FAKE_SYSTEM_STATE")" == "running" ]] || fail 'host start did not recover the container service first'
 [[ "$(cat "$FAKE_STATE_FILE")" == "running" ]] || fail 'host start did not recover the Pi-hole container'
 output="$($CLI config show)"
-assert_contains "$output" 'Local upstreams:  1.1.1.1;9.9.9.9 (currently fixed by Adputate)'
+assert_contains "$output" 'Local upstreams:  192.168.86.1'
+assert_contains "$output" 'Upstream source:  router DHCP (en7)'
 
 output="$($CLI host service plist)"
 assert_contains "$output" "$PROJECT_ROOT/bin/adputate"

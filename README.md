@@ -130,19 +130,26 @@ The CLI reads project identity from `project.env` and persists runtime settings 
 | `ADPUTATE_IMAGE` | `pihole/pihole:2026.07.2` | Pi-hole image tag |
 | `ADPUTATE_MEMORY` | `256M` | Container memory limit |
 | `ADPUTATE_ROUTER_INTERFACE` | detected | LAN interface used by the port-53 frontend |
+| `ADPUTATE_UPSTREAMS` | router-provided | Explicit Pi-hole upstream override, separated by commas or semicolons |
 | `ADPUTATE_APP_DIR` | `~/Library/Application Support/Adputate` | Runtime configuration, logs, and backups |
 | `ADPUTATE_ISSUES_URL` | unset | GitHub issue form opened by `bugreport --open` |
 | `CONTAINER_BIN` | auto-detected | Apple Container executable |
 
-When Adputate initializes a Pi-hole on this Mac, it explicitly forces `1.1.1.1;9.9.9.9` as Pi-hole's upstream resolver list: Cloudflare first and Quad9 second. These are Adputate defaults, not implicit Pi-hole defaults, and they do not alter separately managed Pi-hole nodes such as a NUC. Once the local Pi-hole has been initialized, `adputate config show` displays the effective upstream list and labels it as currently fixed.
+On a fresh local-host configuration, Adputate uses the DNS resolvers supplied by DHCP on the default-route interface. If DHCP does not expose a resolver list, it uses that interface's default router address. The resolved addresses and their source are persisted and shown by both `host config` and `config show`; a later network change does not silently rewrite a running Pi-hole. Run `adputate host configure --upstreams router` to deliberately refresh the choice.
 
-Upstream selection is not configurable yet. Doing this properly requires a persisted upstream-list field, an installer and `host configure` option, validation for Pi-hole's accepted address/port syntax, safe migration of existing `pihole.env` files, an explicit restart/reconciliation path, legible status output, and lifecycle tests. Until that work lands, changing the managed environment file by hand is unsupported because Adputate cannot distinguish an intentional override from drift.
+This default preserves the network operator's existing DNS policy, including local names and split-horizon behavior, instead of silently choosing a public resolver vendor. Cloudflare and Quad9 are ordinary explicit choices, not Adputate policy:
+
+```bash
+adputate host configure --upstreams '1.1.1.1;9.9.9.9'
+```
+
+Lists may be comma- or semicolon-separated and each entry may use Pi-hole's `address#port` form. Adputate rejects loopback, this host's Pi-hole address, and every configured Pi-hole endpoint as a direct upstream. It cannot see an indirect loop inside a router: if the router itself forwards DNS back to this Pi-hole, choose independent upstreams explicitly.
 
 Persist a LAN configuration before creating the container:
 
 ```bash
 bin/adputate host configure --bind-address <mac-lan-ip> --web-port 18080 \
-  --dns-port 5053 --router-interface <interface>
+  --dns-port 5053 --router-interface <interface> --upstreams router
 bin/adputate host config
 bin/adputate host doctor
 bin/adputate host start
@@ -276,6 +283,7 @@ Keeping Apple Container on an unprivileged backend port avoids relying on privil
 - Port numbers, conflicts, and privileged-port constraints
 - Bind-address ownership
 - Image pinning
+- Persisted upstream syntax, direct-loop conflicts, and direct DNS reachability
 - Runtime data-path writability
 - Stale or missing LaunchAgent configuration
 - Active Cloudflare WARP or iCloud Private Relay DNS-path overrides
